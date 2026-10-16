@@ -57,6 +57,7 @@ jobs:
         with:
           workspaces: . -> target
           key: adaptive-${{ matrix.target }}
+          cache-on-failure: true
       - name: Install frontend dependencies
         run: pnpm install --frozen-lockfile
       - name: Check frontend

@@ -77,7 +77,7 @@ if (windows) {
     join(app, 'Contents', 'Info.plist'),
   ]).trim()
   for (const name of [mainBinary, 'verge-mihomo', 'verge-mihomo-alpha']) {
-    run('lipo', ['-verify_arch', arch, join(coreDirectory, name)])
+    run('lipo', [join(coreDirectory, name), '-verify_arch', arch])
   }
 }
 const stable = join(coreDirectory, `verge-mihomo${extension}`)

@@ -9,7 +9,7 @@ import {
   statSync,
   writeFileSync,
 } from 'node:fs'
-import { devNull, homedir } from 'node:os'
+import { homedir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { parseArgs } from 'node:util'
@@ -77,8 +77,10 @@ function run(command, args, env = {}, capture = false) {
 }
 
 // Never reuse an existing checkout or the user's unrelated Mihomo fork.
+const gitConfig = join(root, 'gitconfig')
+writeFileSync(gitConfig, '')
 run('git', ['clone', '--depth', '1', '--branch', tag, upstream, source], {
-  GIT_CONFIG_GLOBAL: devNull,
+  GIT_CONFIG_GLOBAL: gitConfig,
 })
 const actualCommit = run('git', ['-C', source, 'rev-parse', 'HEAD'], {}, true)
 if (actualCommit !== commit)
