@@ -2,3 +2,4 @@
 Changelog.md merge=union
 *.sh text eol=lf
 *.bash text eol=lf
+scripts/patches/*.patch text eol=lf

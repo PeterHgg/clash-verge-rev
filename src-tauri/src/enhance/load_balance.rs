@@ -47,18 +47,21 @@ pub fn transform(mut config: Mapping, enabled: bool) -> Result<(Mapping, Option<
         .collect();
     let mut plan = EnhancementPlan::default();
     let mut managed_providers = HashSet::new();
+    let mut unmanaged_providers = HashSet::new();
     let mut groups = sequence(&config, "proxy-groups").to_vec();
 
     for group in &mut groups {
         let Some(original) = group.as_mapping() else {
             continue;
         };
+        let providers = source_providers(original, &config);
         if text(group, "type") != Some("load-balance") {
+            unmanaged_providers.extend(providers);
             continue;
         }
         let name = text(group, "name").unwrap_or_default().to_owned();
-        let providers = source_providers(original, &config);
         if let Some(reason) = unsupported_reason(original, &providers, &proxy_types, &group_names) {
+            unmanaged_providers.extend(providers);
             plan.unsupported.push(UnsupportedGroup { name, reason });
             continue;
         }
@@ -80,7 +83,7 @@ pub fn transform(mut config: Mapping, enabled: bool) -> Result<(Mapping, Option<
 
     if !plan.groups.is_empty() {
         if let Some(providers) = config.get_mut("proxy-providers").and_then(Value::as_mapping_mut) {
-            for name in managed_providers {
+            for name in managed_providers.difference(&unmanaged_providers) {
                 if let Some(provider) = providers.get_mut(name.as_str()).and_then(Value::as_mapping_mut) {
                     let health = provider
                         .entry(Value::from("health-check"))
@@ -297,6 +300,23 @@ mod tests {
         }
         assert_eq!(group(&runtime, "LB")["url"], "https://provider.invalid/204");
         assert!(plan.expect("plan").internal_names.is_empty());
+    }
+
+    #[test]
+    fn shared_providers_keep_health_checks_for_unmanaged_groups() {
+        for consumer in [
+            "{name: ordinary, type: url-test, use: [only]}",
+            "{name: ordinary, type: fallback, include-all-providers: true}",
+            "{name: ordinary, type: load-balance, strategy: consistent-hashing, use: [only]}",
+        ] {
+            let original = config(&format!(
+                "proxy-providers: {{only: {{type: http, health-check: {{enable: true, interval: 60, url: 'https://provider.invalid/204'}}}}}}\nproxy-groups: [{{name: LB, type: load-balance, strategy: round-robin, use: [only]}}, {consumer}]"
+            ));
+            let (runtime, plan) = transform(original.clone(), true).expect("transform");
+            assert_eq!(runtime["proxy-providers"], original["proxy-providers"]);
+            assert_eq!(group(&runtime, "ordinary"), group(&original, "ordinary"));
+            assert_eq!(plan.expect("plan").groups.len(), 1);
+        }
     }
 
     #[test]
