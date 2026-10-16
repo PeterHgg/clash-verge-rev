@@ -72,6 +72,8 @@ jobs:
         run: |
           node --input-type=module -e 'import {writeFileSync} from "node:fs"; writeFileSync("adaptive-test.conf.json", JSON.stringify({bundle:{createUpdaterArtifacts:false,macOS:{signingIdentity:"-"}}}))'
           pnpm exec tauri build --target "${{ matrix.target }}" --bundles app --config "$GITHUB_WORKSPACE/adaptive-test.conf.json"
+      - name: Finalize identical signed core entries
+        run: node scripts/adaptive-macos-finalize.mjs "$RUNNER_TEMP/adaptive-core" "target/${{ matrix.target }}/release/bundle/macos/Clash Verge.app"
       - name: Verify application and archive
         env:
           ADAPTIVE_TARGET: ${{ matrix.target }}
