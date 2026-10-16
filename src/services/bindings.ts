@@ -234,6 +234,22 @@ export type AutoProxy = {
   url: string
 }
 
+export type CandidateStatus = {
+  name: string
+  score: number | null
+  selected: boolean
+  reachable: boolean
+  freshHealth: boolean
+  proven: boolean
+  confidence: number | null
+  meanRate: number | null
+  peakRate: number | null
+  latencyMs: number | null
+  state: string
+  cooldownRemainingSeconds: number | null
+  lastCheckedSecondsAgo: number | null
+}
+
 export type ClashInfo = {
   /**  clash core port */
   mixed_port: number
@@ -312,6 +328,12 @@ export type FailedOperation =
   | 'systemProxyRestore'
   | 'systemProxyGuard'
 
+export type GroupStatus = {
+  state: string
+  reason: string | null
+  candidates: CandidateStatus[]
+}
+
 /**  Define the `profiles.yaml` schema */
 export type IProfiles = IProfiles_Serialize | IProfiles_Deserialize
 
@@ -381,6 +403,7 @@ export type IVerge_Deserialize = {
   enable_auto_launch?: boolean | null
   enable_silent_start?: boolean | null
   enable_system_proxy?: boolean | null
+  enable_load_balance_enhanced?: boolean | null
   enable_proxy_guard?: boolean | null
   enable_bypass_check?: boolean | null
   /**  Initial DNS override preference for profiles without a saved setting. */
@@ -471,6 +494,7 @@ export type IVerge_Serialize = {
   enable_auto_launch: boolean | null
   enable_silent_start: boolean | null
   enable_system_proxy: boolean | null
+  enable_load_balance_enhanced: boolean | null
   enable_proxy_guard: boolean | null
   enable_bypass_check: boolean | null
   /**  Initial DNS override preference for profiles without a saved setting. */
@@ -820,6 +844,7 @@ export type ProxyGroupView_Deserialize = {
   history: DelayHistory[]
   extra: { [key in string]: ProxyLatencyHistory }
   members: ProxyMemberRef[]
+  enhancement: GroupStatus | null
 } & ProxyCapabilities
 
 export type ProxyGroupView_Serialize = {
@@ -833,6 +858,7 @@ export type ProxyGroupView_Serialize = {
   history: DelayHistory[]
   extra: { [key in string]: ProxyLatencyHistory }
   members: ProxyMemberRef[]
+  enhancement?: GroupStatus | null
 } & ProxyCapabilities
 
 export type ProxyLatencyHistory = {

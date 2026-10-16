@@ -505,6 +505,7 @@ fn reconcile_selected_nodes(
     selected: &[PrfSelected],
     previous: Option<&Proxies>,
     proxies: &Proxies,
+    internal_names: &HashSet<std::string::String>,
 ) -> SelectedNodesPlan {
     let mut plan = SelectedNodesPlan {
         selected: Vec::with_capacity(selected.len()),
@@ -525,6 +526,10 @@ fn reconcile_selected_nodes(
             plan.repaired_count += 1;
             continue;
         };
+        if internal_names.contains(group_name.as_str()) || internal_names.contains(node.as_str()) {
+            plan.repaired_count += 1;
+            continue;
+        }
         let Some(group) = proxies.proxies.get(group_name.as_str()) else {
             if previous.is_some_and(|snapshot| !snapshot.proxies.contains_key(group_name.as_str())) {
                 plan.repaired_count += 1;
@@ -546,7 +551,7 @@ fn reconcile_selected_nodes(
             let preferred_node = group
                 .now
                 .as_deref()
-                .filter(|current| node_is_available(available_nodes, current))
+                .filter(|current| !internal_names.contains(*current) && node_is_available(available_nodes, current))
                 .or_else(|| node_is_available(available_nodes, node).then_some(node.as_str()));
             if let Some(preferred_node) = preferred_node {
                 if preferred_node != node.as_str() {
@@ -584,7 +589,7 @@ fn reconcile_selected_nodes(
         if let Some(current_node) = group
             .now
             .as_deref()
-            .filter(|current| node_is_available(available_nodes, current))
+            .filter(|current| !internal_names.contains(*current) && node_is_available(available_nodes, current))
         {
             plan.selected.push(PrfSelected {
                 name: Some(group_name.clone()),
@@ -714,8 +719,22 @@ where
     Ok(())
 }
 
+async fn runtime_internal_names() -> HashSet<std::string::String> {
+    Config::runtime()
+        .await
+        .data_arc()
+        .load_balance
+        .as_ref()
+        .map(|plan| plan.internal_names.clone())
+        .unwrap_or_default()
+}
+
 /// Records a backend-made selection so the next core start restores it.
 pub(crate) async fn record_selected_node(group_name: &str, node: &str) -> Result<()> {
+    let internal_names = runtime_internal_names().await;
+    if internal_names.contains(group_name) || internal_names.contains(node) {
+        return Ok(());
+    }
     let group_name = String::from(group_name);
     let node = String::from(node);
     persist_selected_update(true, move |mut profiles| async move {
@@ -859,7 +878,9 @@ async fn settle_pending_selections(selected: &[PrfSelected], completed: &mut Has
                 if !is_activation_current(*generation) {
                     return Ok(());
                 }
-                let pending = unsettled_selections(selected, &snapshot);
+                let internal_names = runtime_internal_names().await;
+                let plan = reconcile_selected_nodes(selected, None, &snapshot, &internal_names);
+                let pending = unsettled_selections(&plan.selected, &snapshot);
                 if pending.is_empty() {
                     return Ok(());
                 }
@@ -873,7 +894,6 @@ async fn settle_pending_selections(selected: &[PrfSelected], completed: &mut Has
                     );
                     return Ok(());
                 }
-                let plan = reconcile_selected_nodes(selected, None, &snapshot);
                 if apply_activations(&plan.activations, completed, *generation)
                     .await
                     .is_none()
@@ -913,8 +933,9 @@ async fn activate_selected_nodes_worker(
         return Ok(());
     }
 
-    let needs_confirmation = selected_nodes_need_confirmation(&selected, &first_snapshot);
-    let immediate_plan = reconcile_selected_nodes(&selected, None, &first_snapshot);
+    let internal_names = runtime_internal_names().await;
+    let immediate_plan = reconcile_selected_nodes(&selected, None, &first_snapshot, &internal_names);
+    let needs_confirmation = selected_nodes_need_confirmation(&immediate_plan.selected, &first_snapshot);
     logging!(
         debug,
         Type::Config,
@@ -942,7 +963,9 @@ async fn activate_selected_nodes_worker(
         if !is_activation_current(generation) {
             return Ok(());
         }
-        let confirmed_plan = reconcile_selected_nodes(&selected, Some(&first_snapshot), &second_snapshot);
+        let internal_names = runtime_internal_names().await;
+        let confirmed_plan =
+            reconcile_selected_nodes(&selected, Some(&first_snapshot), &second_snapshot, &internal_names);
         logging!(
             debug,
             Type::Config,
@@ -1202,6 +1225,39 @@ mod tests {
     }
 
     #[test]
+    fn excludes_registered_internal_groups_and_targets_but_keeps_user_prefixes() {
+        let internal_names = HashSet::from(["__verge_lb_slot".to_owned()]);
+        let saved = vec![
+            selected("__verge_lb_slot", "fast"),
+            selected("GLOBAL", "__verge_lb_slot"),
+            selected("__verge_lb_user", "fast"),
+        ];
+        let snapshot = proxies(vec![
+            ("__verge_lb_slot", &["fast", "slow"], Some("slow")),
+            (
+                "GLOBAL",
+                &["__verge_lb_slot", "__verge_lb_user"],
+                Some("__verge_lb_user"),
+            ),
+            ("__verge_lb_user", &["fast", "slow"], Some("slow")),
+        ]);
+        let plan = reconcile_selected_nodes(&saved, None, &snapshot, &internal_names);
+        assert_eq!(plan.selected, vec![selected("__verge_lb_user", "fast")]);
+        assert_eq!(plan.activations, vec![("__verge_lb_user".into(), "fast".into())]);
+        assert_eq!(plan.repaired_count, 2);
+    }
+
+    #[test]
+    fn excludes_internal_current_node_when_repairing_global_selection() {
+        let internal_names = HashSet::from(["__verge_lb_slot".to_owned()]);
+        let saved = vec![selected("GLOBAL", "removed")];
+        let snapshot = proxies(vec![("GLOBAL", &["__verge_lb_slot"], Some("__verge_lb_slot"))]);
+        let plan = reconcile_selected_nodes(&saved, Some(&snapshot), &snapshot, &internal_names);
+        assert!(plan.selected.is_empty());
+        assert!(plan.activations.is_empty());
+    }
+
+    #[test]
     fn removes_only_the_requested_group_selection() {
         let mut selections = vec![selected("Proxy", "Node A"), selected("Fallback", "Node B")];
 
@@ -1247,7 +1303,7 @@ mod tests {
         let unloaded = proxies(vec![("provider-group", &[], None)]);
 
         assert!(
-            reconcile_selected_nodes(&saved, Some(&unloaded), &unloaded)
+            reconcile_selected_nodes(&saved, Some(&unloaded), &unloaded, &HashSet::new())
                 .activations
                 .is_empty(),
             "nothing can be activated while the group is empty"
@@ -1307,7 +1363,7 @@ mod tests {
         let saved = vec![selected("provider-group", "saved")];
         let empty = proxies(vec![]);
 
-        let plan = reconcile_selected_nodes(&saved, Some(&empty), &empty);
+        let plan = reconcile_selected_nodes(&saved, Some(&empty), &empty, &HashSet::new());
 
         assert!(
             plan.selected.is_empty(),
@@ -1324,7 +1380,7 @@ mod tests {
         let had_it = proxies(vec![("provider-group", &["saved"], Some("saved"))]);
         let lost_it = proxies(vec![]);
 
-        let plan = reconcile_selected_nodes(&saved, Some(&had_it), &lost_it);
+        let plan = reconcile_selected_nodes(&saved, Some(&had_it), &lost_it, &HashSet::new());
 
         assert_eq!(plan.selected, saved);
         assert_eq!(plan.repaired_count, 0);
@@ -1353,6 +1409,7 @@ mod tests {
             &saved,
             None,
             &proxies(vec![("group", &["current", "saved"], Some("current"))]),
+            &HashSet::new(),
         );
 
         assert_eq!(plan.selected, saved);
@@ -1363,7 +1420,12 @@ mod tests {
     #[test]
     fn replaces_missing_node_with_valid_current_node() {
         let snapshot = proxies(vec![("group", &["current"], Some("current"))]);
-        let plan = reconcile_selected_nodes(&[selected("group", "renamed-node")], Some(&snapshot), &snapshot);
+        let plan = reconcile_selected_nodes(
+            &[selected("group", "renamed-node")],
+            Some(&snapshot),
+            &snapshot,
+            &HashSet::new(),
+        );
 
         assert_eq!(plan.selected, vec![selected("group", "current")]);
         assert!(plan.activations.is_empty());
@@ -1376,7 +1438,12 @@ mod tests {
             ("group", &["current"], Some("current")),
             ("other-node", &[], None),
         ]);
-        let plan = reconcile_selected_nodes(&[selected("group", "other-node")], Some(&snapshot), &snapshot);
+        let plan = reconcile_selected_nodes(
+            &[selected("group", "other-node")],
+            Some(&snapshot),
+            &snapshot,
+            &HashSet::new(),
+        );
 
         assert_eq!(plan.selected, vec![selected("group", "current")]);
         assert!(plan.activations.is_empty());
@@ -1398,7 +1465,7 @@ mod tests {
             )]),
         };
 
-        let plan = reconcile_selected_nodes(&[selected("group", "saved")], None, &snapshot);
+        let plan = reconcile_selected_nodes(&[selected("group", "saved")], None, &snapshot, &HashSet::new());
 
         assert_eq!(plan.selected, vec![selected("group", "current")]);
         assert!(plan.activations.is_empty());
@@ -1416,6 +1483,7 @@ mod tests {
             ],
             Some(&snapshot),
             &snapshot,
+            &HashSet::new(),
         );
 
         assert!(plan.selected.is_empty());
@@ -1429,8 +1497,8 @@ mod tests {
         let incomplete = proxies(vec![("group", &[], None)]);
         let complete = proxies(vec![("group", &["current"], Some("current"))]);
 
-        let incomplete_plan = reconcile_selected_nodes(&saved, None, &incomplete);
-        let one_snapshot_plan = reconcile_selected_nodes(&saved, None, &complete);
+        let incomplete_plan = reconcile_selected_nodes(&saved, None, &incomplete, &HashSet::new());
+        let one_snapshot_plan = reconcile_selected_nodes(&saved, None, &complete, &HashSet::new());
 
         assert_eq!(incomplete_plan.selected, saved);
         assert_eq!(incomplete_plan.repaired_count, 0);
@@ -1444,7 +1512,7 @@ mod tests {
         let incomplete = Proxies::default();
         let complete = proxies(vec![("group", &["current", "saved"], Some("current"))]);
 
-        let plan = reconcile_selected_nodes(&saved, Some(&incomplete), &complete);
+        let plan = reconcile_selected_nodes(&saved, Some(&incomplete), &complete, &HashSet::new());
 
         assert_eq!(plan.selected, saved);
         assert_eq!(plan.activations, vec![("group".into(), "saved".into())]);
@@ -1456,7 +1524,7 @@ mod tests {
         let saved = vec![selected("group", "old"), selected("group", "new")];
         let snapshot = proxies(vec![("group", &["old", "new"], Some("old"))]);
 
-        let plan = reconcile_selected_nodes(&saved, None, &snapshot);
+        let plan = reconcile_selected_nodes(&saved, None, &snapshot, &HashSet::new());
 
         assert_eq!(plan.selected, vec![selected("group", "new")]);
         assert_eq!(plan.activations, vec![("group".into(), "new".into())]);
@@ -1472,7 +1540,7 @@ mod tests {
         ]);
 
         assert!(selected_nodes_need_confirmation(&saved, &first_snapshot));
-        let immediate_plan = reconcile_selected_nodes(&saved, None, &first_snapshot);
+        let immediate_plan = reconcile_selected_nodes(&saved, None, &first_snapshot, &HashSet::new());
 
         assert_eq!(immediate_plan.selected, saved);
         assert_eq!(immediate_plan.activations, vec![("valid-group".into(), "saved".into())]);

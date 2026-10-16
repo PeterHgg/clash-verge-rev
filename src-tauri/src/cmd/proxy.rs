@@ -4,6 +4,7 @@ use crate::{
     config::Config,
     core::{
         handle::Handle,
+        load_balance::native_statuses,
         proxy_view::{GroupScope, ProxyViewBuilder, ProxyViewInput, ProxyViewV1},
         tray::Tray,
     },
@@ -33,6 +34,26 @@ pub async fn forget_selected_node(group_name: String) -> CmdResult<()> {
         .stringify_err()
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn enhanced_parent_scope_uses_original_provider_sources() -> anyhow::Result<()> {
+        let config = serde_yaml_ng::from_str(
+            "proxy-providers: {provider: {type: http}}\nproxy-groups: [{name: LB, type: load-balance, strategy: round-robin, use: [provider], exclude-type: vmess}]",
+        )?;
+        let (runtime, plan) = crate::enhance::load_balance::transform(config, true)?;
+        let scopes = runtime_group_scopes(Some(&runtime), plan.as_ref());
+        let scope = scopes
+            .get("LB")
+            .ok_or_else(|| anyhow::anyhow!("expected parent scope"))?;
+        assert_eq!(scope.providers, ["provider"]);
+        assert_eq!(scope.exclude_types, ["vmess"]);
+        Ok(())
+    }
+}
+
 static TRAY_SYNC_RUNNING: AtomicBool = AtomicBool::new(false);
 static TRAY_SYNC_PENDING: AtomicBool = AtomicBool::new(false);
 
@@ -53,7 +74,10 @@ fn runtime_group_order(config: Option<&Mapping>) -> Vec<String> {
 }
 
 /// Mirrors Mihomo: `include-all`/`include-all-providers` replace `use` with every provider, sorted.
-fn runtime_group_scopes(config: Option<&Mapping>) -> BTreeMap<String, GroupScope> {
+fn runtime_group_scopes(
+    config: Option<&Mapping>,
+    enhancement: Option<&crate::enhance::load_balance::EnhancementPlan>,
+) -> BTreeMap<String, GroupScope> {
     let Some(config) = config else {
         return BTreeMap::new();
     };
@@ -74,6 +98,14 @@ fn runtime_group_scopes(config: Option<&Mapping>) -> BTreeMap<String, GroupScope
         .into_iter()
         .flatten()
         .filter_map(|group| group.as_mapping())
+        .map(|group| {
+            enhancement
+                .and_then(|plan| {
+                    let name = group.get("name")?.as_str()?;
+                    plan.groups.iter().find(|planned| planned.name == name)
+                })
+                .map_or(group, |planned| &planned.original)
+        })
         .filter_map(|group| {
             let name = group.get("name")?.as_str()?.to_owned();
             let providers = if flag(group, "include-all") || flag(group, "include-all-providers") {
@@ -112,11 +144,6 @@ pub async fn get_proxy_view() -> CmdResult<ProxyViewV1> {
 }
 
 pub(crate) async fn proxy_view(provider_timeout: Option<std::time::Duration>) -> CmdResult<ProxyViewV1> {
-    let runtime = Config::runtime().await;
-    let latest_runtime = runtime.latest_arc();
-    let runtime_group_order = runtime_group_order(latest_runtime.config.as_ref());
-    let group_scopes = runtime_group_scopes(latest_runtime.config.as_ref());
-
     let mihomo = Handle::mihomo();
     let (proxies, providers) = tokio::join!(mihomo.get_proxies(), async {
         match provider_timeout {
@@ -128,13 +155,25 @@ pub(crate) async fn proxy_view(provider_timeout: Option<std::time::Duration>) ->
         }
     });
     let proxies = proxies.stringify_err()?;
+    let applied_runtime = Config::runtime().await.data_arc();
+    let runtime_group_order = runtime_group_order(applied_runtime.config.as_ref());
+    let group_scopes = runtime_group_scopes(applied_runtime.config.as_ref(), applied_runtime.load_balance.as_ref());
+    let status = applied_runtime
+        .load_balance
+        .as_ref()
+        .map(|plan| native_statuses(&proxies, plan))
+        .unwrap_or_default();
 
-    Ok(ProxyViewBuilder::build(ProxyViewInput {
-        runtime_group_order,
-        group_scopes,
-        proxies,
-        providers,
-    }))
+    Ok(ProxyViewBuilder::build_enhanced(
+        ProxyViewInput {
+            runtime_group_order,
+            group_scopes,
+            proxies,
+            providers,
+        },
+        applied_runtime.load_balance.as_ref(),
+        status,
+    ))
 }
 
 #[tauri::command]

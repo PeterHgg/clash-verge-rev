@@ -5,11 +5,11 @@ import {
 import {
   Box,
   Button,
-  Chip,
   CircularProgress,
   List,
   ListItemButton,
   ListItemText,
+  Tooltip,
 } from '@mui/material'
 import { useLockFn } from 'ahooks'
 import type { Ref } from 'react'
@@ -26,14 +26,12 @@ import { showNotice } from '@/services/notice-service'
 
 const VALID_CORE = [
   {
-    name: 'Mihomo',
     core: 'verge-mihomo',
-    chipKey: 'settings.modals.clashCore.variants.release',
+    labelKey: 'settings.modals.clashCore.variants.release',
   },
   {
-    name: 'Mihomo Alpha',
     core: 'verge-mihomo-alpha',
-    chipKey: 'settings.modals.clashCore.variants.alpha',
+    labelKey: 'settings.modals.clashCore.variants.alpha',
   },
 ]
 
@@ -41,7 +39,7 @@ export function ClashCoreViewer({ ref }: { ref?: Ref<DialogRef> }) {
   const { t } = useTranslation()
 
   const { verge, mutateVerge } = useVerge()
-  const { mutateVersion } = useClash()
+  const { version, mutateVersion } = useClash()
   const { invalidateClashConfig } = useClashInfo()
 
   const [open, setOpen] = useState(false)
@@ -55,6 +53,7 @@ export function ClashCoreViewer({ ref }: { ref?: Ref<DialogRef> }) {
   }))
 
   const { clash_core = 'verge-mihomo' } = verge ?? {}
+  const customCore = version.includes('verge-adaptive')
 
   const onCoreChange = useLockFn(async (core: string) => {
     if (core === clash_core) return
@@ -131,18 +130,28 @@ export function ClashCoreViewer({ ref }: { ref?: Ref<DialogRef> }) {
         <Box sx={{ display: 'flex', justifyContent: 'space-between' }}>
           {t('settings.sections.clash.form.fields.clashCore')}
           <Box>
-            <Button
-              variant="contained"
-              size="small"
-              startIcon={<SwitchAccessShortcutRounded />}
-              loadingPosition="start"
-              loading={upgrading}
-              disabled={restarting || changingCore !== null}
-              sx={{ marginRight: '8px' }}
-              onClick={onUpgrade}
+            <Tooltip
+              title={
+                customCore
+                  ? t('settings.modals.clashCore.upgradeUnavailable')
+                  : ''
+              }
             >
-              {t('shared.actions.upgrade')}
-            </Button>
+              <span>
+                <Button
+                  variant="contained"
+                  size="small"
+                  startIcon={<SwitchAccessShortcutRounded />}
+                  loadingPosition="start"
+                  loading={upgrading}
+                  disabled={customCore || restarting || changingCore !== null}
+                  sx={{ marginRight: '8px' }}
+                  onClick={onUpgrade}
+                >
+                  {t('shared.actions.upgrade')}
+                </Button>
+              </span>
+            </Tooltip>
             <Button
               variant="contained"
               size="small"
@@ -178,11 +187,12 @@ export function ClashCoreViewer({ ref }: { ref?: Ref<DialogRef> }) {
             onClick={() => onCoreChange(each.core)}
             disabled={changingCore !== null || restarting || upgrading}
           >
-            <ListItemText primary={each.name} secondary={`/${each.core}`} />
-            {changingCore === each.core ? (
+            <ListItemText
+              primary={`Mihomo ${t(each.labelKey)}`}
+              secondary={`/${each.core}`}
+            />
+            {changingCore === each.core && (
               <CircularProgress size={20} sx={{ mr: 1 }} />
-            ) : (
-              <Chip label={t(each.chipKey)} size="small" />
             )}
           </ListItemButton>
         ))}

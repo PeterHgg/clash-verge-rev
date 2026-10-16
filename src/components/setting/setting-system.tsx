@@ -19,7 +19,11 @@ const SettingSystem = ({ onError }: Props) => {
 
   const { verge, mutateVerge, patchVerge } = useVerge()
 
-  const { enable_auto_launch, enable_silent_start } = verge ?? {}
+  const {
+    enable_auto_launch,
+    enable_silent_start,
+    enable_load_balance_enhanced,
+  } = verge ?? {}
 
   const sysproxyRef = useRef<DialogRef>(null)
   const tunRef = useRef<DialogRef>(null)
@@ -46,6 +50,27 @@ const SettingSystem = ({ onError }: Props) => {
         label={t('settings.sections.system.toggles.systemProxy')}
         onError={onError}
       />
+
+      <SettingItem
+        label={t('settings.sections.system.fields.loadBalanceEnhanced')}
+        extra={
+          <TooltipIcon
+            title={t('settings.sections.system.tooltips.loadBalanceEnhanced')}
+            sx={{ opacity: '0.7' }}
+          />
+        }
+      >
+        <GuardState
+          value={enable_load_balance_enhanced ?? false}
+          valueProps="checked"
+          onCatch={onError}
+          onFormat={onSwitchFormat}
+          onChange={(e) => onChangeData({ enable_load_balance_enhanced: e })}
+          onGuard={(e) => patchVerge({ enable_load_balance_enhanced: e })}
+        >
+          <Switch edge="end" />
+        </GuardState>
+      </SettingItem>
 
       <SettingItem label={t('settings.sections.system.fields.autoLaunch')}>
         <GuardState

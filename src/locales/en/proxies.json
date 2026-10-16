@@ -1,5 +1,45 @@
 {
   "page": {
+    "enhancement": {
+      "states": {
+        "warming": "Still getting a feel",
+        "active": "Picking nodes for you",
+        "probing": "Checking latency",
+        "trial": "Limited trial",
+        "cooldown": "Trying again later",
+        "draining": "Letting earlier connections finish",
+        "unavailable": "No usable nodes right now",
+        "quarantined": "On hold for now",
+        "unsupported": "Not supported for this group yet"
+      },
+      "descriptions": {
+        "warming": "Getting a feel for how each node performs",
+        "active": "Favoring nodes that work well right now",
+        "probing": "Reusing or updating Clash’s built-in latency tests without downloading extra speed-test files",
+        "trial": "Trying a backup node with a few new connections",
+        "cooldown": "Will try again later; other usable nodes are unaffected",
+        "draining": "Earlier connections are still in use and can finish naturally",
+        "unavailable": "No nodes that can connect have been found yet",
+        "quarantined": "Checking connection status; no new connections are being assigned for now",
+        "unsupported": "Keeping the original connection method for now"
+      },
+      "candidates": {
+        "probing": "Checking",
+        "trial": "Limited trial",
+        "selected": "In use",
+        "cooldown": "Trying again later",
+        "standby": "Backup",
+        "untested": "Still getting a feel",
+        "unavailable": "Can't connect right now"
+      },
+      "insufficientEvidence": "Still getting a feel",
+      "keepObserving": "Let's see how it goes",
+      "technicalDetails": "Detailed reason (for troubleshooting)",
+      "score": "Score {{score}}",
+      "retryRemaining": "Trying again in {{seconds}} s",
+      "checkRecency": "Checked {{seconds}} s ago",
+      "notChecked": "Not checked yet"
+    },
     "modes": {
       "rule": "Rule",
       "global": "Global",

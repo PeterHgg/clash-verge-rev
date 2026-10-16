@@ -1,5 +1,45 @@
 {
   "page": {
+    "enhancement": {
+      "states": {
+        "warming": "Masih mengamati",
+        "active": "Memilihkan node untuk Anda",
+        "probing": "Memeriksa latensi",
+        "trial": "Uji coba terbatas",
+        "cooldown": "Coba lagi nanti",
+        "draining": "Menunggu koneksi sebelumnya selesai",
+        "unavailable": "Belum ada node yang bisa dipakai",
+        "quarantined": "Dijeda sementara",
+        "unsupported": "Grup ini belum didukung"
+      },
+      "descriptions": {
+        "warming": "Melihat dulu bagaimana kinerja tiap node",
+        "active": "Mengutamakan node yang bekerja dengan baik saat ini",
+        "probing": "Menggunakan ulang atau memperbarui uji latensi bawaan Clash tanpa mengunduh berkas uji kecepatan tambahan",
+        "trial": "Mencoba node cadangan dengan beberapa koneksi baru",
+        "cooldown": "Akan mencoba lagi nanti tanpa memengaruhi node lain yang bisa dipakai",
+        "draining": "Koneksi sebelumnya masih dipakai dan dibiarkan selesai dengan sendirinya",
+        "unavailable": "Belum menemukan node yang bisa terhubung",
+        "quarantined": "Memeriksa status koneksi; untuk sementara tidak membagikan koneksi baru",
+        "unsupported": "Untuk sementara tetap memakai cara koneksi semula"
+      },
+      "candidates": {
+        "probing": "Sedang diperiksa",
+        "trial": "Uji coba terbatas",
+        "selected": "Sedang dipakai",
+        "cooldown": "Coba lagi nanti",
+        "standby": "Cadangan",
+        "untested": "Masih mengamati",
+        "unavailable": "Belum bisa terhubung"
+      },
+      "insufficientEvidence": "Masih mengamati",
+      "keepObserving": "Mari lihat bagaimana selanjutnya",
+      "technicalDetails": "Alasan lengkap (untuk mengatasi masalah)",
+      "score": "Skor {{score}}",
+      "retryRemaining": "Coba lagi dalam {{seconds}} dtk",
+      "checkRecency": "Diperiksa {{seconds}} dtk lalu",
+      "notChecked": "Belum diperiksa"
+    },
     "modes": {
       "rule": "Rule",
       "global": "Global",

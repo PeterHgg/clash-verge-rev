@@ -53,6 +53,8 @@ pub async fn upgrade_core(force: bool) -> Result<CoreUpgradeReport> {
         std::string::String::new()
     });
 
+    ensure_official_upgrade_allowed(&installed)?;
+
     let (proxy, latest) = resolve_latest_version(alpha).await?;
     let span = tracing::Span::current();
     span.record("from", tracing::field::display(&installed));
@@ -145,6 +147,13 @@ pub async fn upgrade_core(force: bool) -> Result<CoreUpgradeReport> {
     let _ = std::fs::remove_file(target.with_extension("old"));
 
     Ok(CoreUpgradeReport { upgraded: true })
+}
+
+fn ensure_official_upgrade_allowed(installed: &str) -> Result<()> {
+    if installed.contains("verge-adaptive") {
+        bail!("This version uses a custom Mihomo core. Update the application with a custom-core build instead.");
+    }
+    Ok(())
 }
 
 /// Whether this upgrade handed bytes to the Service's approved core directory.
@@ -466,7 +475,17 @@ fn read_core_version(path: &Path) -> Result<std::string::String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_usable_version, package_url};
+    use super::{ensure_official_upgrade_allowed, is_usable_version, package_url};
+
+    #[test]
+    fn official_updates_cannot_replace_custom_adaptive_cores() {
+        for version in ["v1.19.32-verge-adaptive1", "v1.19.32-verge-adaptive2"] {
+            assert!(ensure_official_upgrade_allowed(version).is_err());
+        }
+        for version in ["v1.19.32", "alpha-c0e43eb", ""] {
+            assert!(ensure_official_upgrade_allowed(version).is_ok());
+        }
+    }
 
     #[test]
     fn only_plain_version_tokens_reach_the_package_url() {

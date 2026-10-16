@@ -1,5 +1,45 @@
 {
   "page": {
+    "enhancement": {
+      "states": {
+        "warming": "Seguimos observando",
+        "active": "Elegimos nodos por ti",
+        "probing": "Comprobando latencia",
+        "trial": "Prueba limitada",
+        "cooldown": "Lo intentaremos más tarde",
+        "draining": "Dejando que terminen las conexiones anteriores",
+        "unavailable": "No hay nodos utilizables por ahora",
+        "quarantined": "En pausa por ahora",
+        "unsupported": "Este grupo aún no es compatible"
+      },
+      "descriptions": {
+        "warming": "Primero vemos cómo funciona cada nodo",
+        "active": "Damos prioridad a los nodos que funcionan bien ahora",
+        "probing": "Reutilizando o actualizando las pruebas de latencia integradas de Clash, sin descargar archivos adicionales para medir la velocidad",
+        "trial": "Probamos un nodo de reserva con unas pocas conexiones nuevas",
+        "cooldown": "Lo intentaremos más tarde sin afectar a los otros nodos utilizables",
+        "draining": "Las conexiones anteriores siguen en uso y pueden terminar por sí solas",
+        "unavailable": "Por ahora no hemos encontrado nodos que puedan conectarse",
+        "quarantined": "Comprobamos el estado de las conexiones; por ahora no asignamos conexiones nuevas",
+        "unsupported": "Por ahora mantenemos la forma de conexión original"
+      },
+      "candidates": {
+        "probing": "Comprobando",
+        "trial": "Prueba limitada",
+        "selected": "En uso",
+        "cooldown": "Lo intentaremos más tarde",
+        "standby": "Reserva",
+        "untested": "Seguimos observando",
+        "unavailable": "No se puede conectar por ahora"
+      },
+      "insufficientEvidence": "Seguimos observando",
+      "keepObserving": "Veamos qué tal sigue",
+      "technicalDetails": "Motivo detallado (para resolver problemas)",
+      "score": "Puntuación {{score}}",
+      "retryRemaining": "Nuevo intento en {{seconds}} s",
+      "checkRecency": "Comprobado hace {{seconds}} s",
+      "notChecked": "Aún no se ha comprobado"
+    },
     "modes": {
       "rule": "Rule",
       "global": "Global",

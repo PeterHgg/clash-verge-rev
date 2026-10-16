@@ -16,11 +16,13 @@
         "systemProxy": "시스템 프록시"
       },
       "tooltips": {
-        "silentStart": "패널을 표시하지 않고 백그라운드에서 시작합니다"
+        "silentStart": "패널을 표시하지 않고 백그라운드에서 시작합니다",
+        "loadBalanceEnhanced": "처음에는 사용 가능한 것으로 확인된 저지연 노드를 최대 3개 고르고, 이후에는 실제 전송 성능을 더 중요하게 반영해요. 코어가 직접 노드를 선택하고 번갈아 사용하며, 창을 숨겨도 자율적으로 동작해요. 클라이언트는 결과만 표시해요. 설정된 테스트 URL로 Clash 내장 테스트만 사용하며 별도의 속도 측정 파일은 다운로드하지 않아요. 함께 제공되는 맞춤 Mihomo v1.19.32-verge-adaptive1과 원래 설정에 round-robin이 명시된 그룹이 필요해요. 두 적응형 코어 항목은 같은 맞춤 코어를 사용해요. 지원하지 않는 그룹은 원래 방식을 유지하고, 끄면 원래 설정으로 돌아가요. 켜거나 끌 때 연결에 잠깐 영향을 줄 수 있어요."
       },
       "fields": {
         "autoLaunch": "자동 실행",
-        "silentStart": "백그라운드 시작"
+        "silentStart": "백그라운드 시작",
+        "loadBalanceEnhanced": "향상된 부하 분산"
       },
       "notifications": {
         "tunMode": {
@@ -303,9 +305,10 @@
     },
     "clashCore": {
       "variants": {
-        "release": "안정 버전",
-        "alpha": "알파 버전"
-      }
+        "release": "적응형",
+        "alpha": "적응형 (호환용)"
+      },
+      "upgradeUnavailable": "이 버전은 맞춤 코어를 사용해요. 업데이트하려면 맞춤 코어가 포함된 새 앱 버전을 설치해 주세요."
     },
     "liteMode": {
       "title": "경량 모드 설정",

@@ -61,6 +61,7 @@ export const hasRenderableItems = (
 type GroupCache = {
   now: string | undefined
   members: ProxyGroupView['members']
+  enhancement: ProxyGroupView['enhancement']
   headState: HeadState
   col: number
   latencyTimeout: number | undefined
@@ -274,6 +275,7 @@ export const useRenderList = (
         cached &&
         cached.now === group.now &&
         cached.members === group.members &&
+        cached.enhancement === group.enhancement &&
         cached.headState === headState &&
         cached.col === col &&
         cached.latencyTimeout === latencyTimeout &&
@@ -306,6 +308,7 @@ export const useRenderList = (
             matchWholeWord: headState.filterMatchWholeWord,
             useRegularExpression: headState.filterUseRegularExpression,
           },
+          group,
         )
         if (!useRule) {
           ret.push({ type: 1, key: `head-${group.name}`, group, headState })
@@ -339,6 +342,7 @@ export const useRenderList = (
       cache.set(group.name, {
         now: group.now!,
         members: group.members,
+        enhancement: group.enhancement,
         headState,
         col,
         latencyTimeout: latencyTimeout!,

@@ -562,6 +562,46 @@ export interface TranslationResources {
             title: string
           }
         }
+        enhancement: {
+          candidates: {
+            cooldown: string
+            probing: string
+            selected: string
+            standby: string
+            trial: string
+            unavailable: string
+            untested: string
+          }
+          checkRecency: string
+          descriptions: {
+            active: string
+            cooldown: string
+            draining: string
+            probing: string
+            quarantined: string
+            trial: string
+            unavailable: string
+            unsupported: string
+            warming: string
+          }
+          insufficientEvidence: string
+          keepObserving: string
+          notChecked: string
+          retryRemaining: string
+          score: string
+          states: {
+            active: string
+            cooldown: string
+            draining: string
+            probing: string
+            quarantined: string
+            trial: string
+            unavailable: string
+            unsupported: string
+            warming: string
+          }
+          technicalDetails: string
+        }
         labels: {
           delayCheckReset: string
           nodeCount: string
@@ -943,6 +983,7 @@ export interface TranslationResources {
           }
         }
         clashCore: {
+          upgradeUnavailable: string
           variants: {
             alpha: string
             release: string
@@ -1375,6 +1416,7 @@ export interface TranslationResources {
         system: {
           fields: {
             autoLaunch: string
+            loadBalanceEnhanced: string
             silentStart: string
           }
           notifications: {
@@ -1389,6 +1431,7 @@ export interface TranslationResources {
             tunMode: string
           }
           tooltips: {
+            loadBalanceEnhanced: string
             silentStart: string
           }
         }

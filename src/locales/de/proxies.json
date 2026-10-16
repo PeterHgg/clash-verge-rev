@@ -1,5 +1,45 @@
 {
   "page": {
+    "enhancement": {
+      "states": {
+        "warming": "Wir schauen noch",
+        "active": "Wir wählen für dich aus",
+        "probing": "Latenz wird geprüft",
+        "trial": "Begrenzter Probebetrieb",
+        "cooldown": "Später noch mal versuchen",
+        "draining": "Bisherige Verbindungen dürfen fertig werden",
+        "unavailable": "Gerade kein nutzbarer Knoten",
+        "quarantined": "Vorerst pausiert",
+        "unsupported": "Für diese Gruppe noch nicht unterstützt"
+      },
+      "descriptions": {
+        "warming": "Wir schauen erst, wie gut die einzelnen Knoten funktionieren",
+        "active": "Bevorzugt werden Knoten, die gerade gut funktionieren",
+        "probing": "Die integrierten Latenztests von Clash werden wiederverwendet oder aktualisiert, ohne zusätzliche Geschwindigkeitstestdateien herunterzuladen",
+        "trial": "Ein Ersatzknoten wird mit wenigen neuen Verbindungen ausprobiert",
+        "cooldown": "Später wird es erneut versucht; andere nutzbare Knoten bleiben unberührt",
+        "draining": "Bisherige Verbindungen laufen noch und dürfen von selbst enden",
+        "unavailable": "Bisher wurde kein Knoten gefunden, der sich verbinden kann",
+        "quarantined": "Der Verbindungsstatus wird geprüft; vorerst werden keine neuen Verbindungen zugeteilt",
+        "unsupported": "Vorerst bleibt die ursprüngliche Verbindungsweise erhalten"
+      },
+      "candidates": {
+        "probing": "Wird geprüft",
+        "trial": "Begrenzter Probebetrieb",
+        "selected": "In Benutzung",
+        "cooldown": "Später noch mal versuchen",
+        "standby": "Reserve",
+        "untested": "Wir schauen noch",
+        "unavailable": "Verbindung gerade nicht möglich"
+      },
+      "insufficientEvidence": "Wir schauen noch",
+      "keepObserving": "Schauen wir, wie es weiterläuft",
+      "technicalDetails": "Genauer Grund (zur Fehlersuche)",
+      "score": "Bewertung {{score}}",
+      "retryRemaining": "Neuer Versuch in {{seconds}} s",
+      "checkRecency": "Vor {{seconds}} s geprüft",
+      "notChecked": "Noch nicht geprüft"
+    },
     "modes": {
       "rule": "Regel",
       "global": "Global",

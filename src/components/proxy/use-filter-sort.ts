@@ -1,5 +1,5 @@
 import delayManager from '@/services/delay'
-import { memberDetails } from '@/types/proxy-view'
+import { memberDetails, type ProxyGroupView } from '@/types/proxy-view'
 import { compareByDelay, DEFAULT_DELAY_TIMEOUT } from '@/utils/delay'
 import { compileStringMatcher } from '@/utils/search-matcher'
 
@@ -20,10 +20,33 @@ export function filterSort(
   sortType: ProxySortType,
   latencyTimeout?: number,
   searchState?: ProxySearchState,
+  group?: Pick<ProxyGroupView, 'type' | 'enhancement'>,
 ) {
   const fp = filterProxies(proxies, groupName, filterText, searchState)
   const sp = sortProxies(fp, groupName, sortType, latencyTimeout)
-  return sp
+  if (
+    group?.type !== 'LoadBalance' ||
+    !group.enhancement ||
+    group.enhancement.state === 'unsupported'
+  ) {
+    return sp
+  }
+
+  // Only actual slot occupants are pinned; paused incumbents remain in the sorted tail.
+  const selected = group.enhancement.candidates
+    .filter((candidate) => candidate.selected)
+    .sort(
+      (left, right) =>
+        Number(right.state === 'selected') - Number(left.state === 'selected'),
+    )
+  const ranks = new Map(selected.map(({ name }, index) => [name, index]))
+  if (ranks.size === 0) return sp
+
+  return sp.slice().sort((left, right) => {
+    const leftRank = ranks.get(left.member.ref.name) ?? ranks.size
+    const rightRank = ranks.get(right.member.ref.name) ?? ranks.size
+    return leftRank - rightRank
+  })
 }
 
 const regex1 = /delay([=<>])(\d+|timeout|error)/i

@@ -16,11 +16,13 @@
         "systemProxy": "系统代理"
       },
       "tooltips": {
-        "silentStart": "程序启动时以后台模式运行，不显示程序面板"
+        "silentStart": "程序启动时以后台模式运行，不显示程序面板",
+        "loadBalanceEnhanced": "先选择最多 3 个已确认可用、延迟最低的节点，再更看重真实传输表现。由内核直接挑选与轮询，客户端仅展示结果，隐藏窗口后仍在后台运行。只使用 Clash 自带的延迟测试，访问配置的测试链接，不额外下载测速文件。需使用随包提供的定制 Mihomo v1.19.32-verge-adaptive1，两个自适应内核入口使用同一定制内核，且原配置明确使用 round-robin；不支持的组沿用原方式，关闭恢复原配置，开关此功能可能短暂影响连接。"
       },
       "fields": {
         "autoLaunch": "开机自启",
-        "silentStart": "静默启动"
+        "silentStart": "静默启动",
+        "loadBalanceEnhanced": "负载均衡增强"
       },
       "notifications": {
         "tunMode": {
@@ -303,9 +305,10 @@
     },
     "clashCore": {
       "variants": {
-        "release": "正式版",
-        "alpha": "预览版"
-      }
+        "release": "自适应",
+        "alpha": "自适应（兼容入口）"
+      },
+      "upgradeUnavailable": "此版本使用定制内核，请通过安装新版定制应用升级。"
     },
     "liteMode": {
       "title": "轻量模式设置",

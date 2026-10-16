@@ -1,0 +1,83 @@
+name: Adaptive test packages
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [adaptive/macos-build]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: adaptive-build-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_INCREMENTAL: 0
+  CARGO_NET_GIT_FETCH_WITH_CLI: true
+  HUSKY: 0
+  NODE_OPTIONS: --max-old-space-size=4096
+
+jobs:
+  build:
+    if: github.repository == 'PeterHgg/clash-verge-rev'
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        include:
+          - os: macos-15
+            target: aarch64-apple-darwin
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+          - os: windows-2025
+            target: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: '24.21.0'
+      - uses: pnpm/action-setup@f520eceda224fe1a4aed5a2a27a194379a409996 # v6
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: '1.99.0'
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: . -> target
+          key: adaptive-${{ matrix.target }}
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Check frontend
+        run: |
+          pnpm typecheck
+          pnpm test
+          pnpm arch:check
+      - name: Prepare original packaging resources
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: pnpm run prebuild "${{ matrix.target }}"
+      - name: Build and bundle both custom core entries
+        run: node scripts/mihomo-local-build.mjs --target "${{ matrix.target }}" --output "$RUNNER_TEMP/adaptive-core" --bundle
+      - name: Build unsigned test installer
+        # Do not use pnpm build: its prebuild lifecycle could replace the custom cores.
+        run: |
+          node --input-type=module -e 'import {writeFileSync} from "node:fs"; writeFileSync("adaptive-test.conf.json", JSON.stringify({bundle:{createUpdaterArtifacts:false,...(process.platform === "darwin" ? {macOS:{signingIdentity:"-"}} : {})}}))'
+          pnpm exec tauri build --target "${{ matrix.target }}" --config "$GITHUB_WORKSPACE/adaptive-test.conf.json"
+      - name: Verify packaged cores and collect artifacts
+        env:
+          ADAPTIVE_TARGET: ${{ matrix.target }}
+        run: node scripts/adaptive-artifacts.mjs "$RUNNER_TEMP/adaptive-core" "$RUNNER_TEMP/adaptive-artifacts"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: Adaptive-2.5.9-${{ matrix.target }}
+          path: ${{ runner.temp }}/adaptive-artifacts/*
+          if-no-files-found: error
+          retention-days: 30

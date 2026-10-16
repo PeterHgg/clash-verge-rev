@@ -1,5 +1,45 @@
 {
   "page": {
+    "enhancement": {
+      "states": {
+        "warming": "まだ様子を見ています",
+        "active": "使いやすいノードを選んでいます",
+        "probing": "遅延を確認中",
+        "trial": "少数の接続で試用中",
+        "cooldown": "少し待ってから再び試します",
+        "draining": "これまでの接続が終わるのを待っています",
+        "unavailable": "今は使えるノードがありません",
+        "quarantined": "いったん停止しています",
+        "unsupported": "このグループにはまだ対応していません"
+      },
+      "descriptions": {
+        "warming": "まず各ノードの調子を見ています",
+        "active": "今うまく使えるノードを優先しています",
+        "probing": "Clash内蔵の遅延テストを再利用または更新しています。追加の速度測定ファイルはダウンロードしません",
+        "trial": "少数の新しい接続で予備のノードを試しています",
+        "cooldown": "少し待ってから再び試します。他の使えるノードには影響しません",
+        "draining": "これまでの接続はまだ使われているため、自然に終わるのを待っています",
+        "unavailable": "接続できるノードがまだ見つかっていません",
+        "quarantined": "接続状況を確認しています。今は新しい接続を割り当てません",
+        "unsupported": "今は元の接続方法をそのまま使います"
+      },
+      "candidates": {
+        "probing": "確認中",
+        "trial": "少数の接続で試用中",
+        "selected": "使用中",
+        "cooldown": "少し待ってから再び試します",
+        "standby": "予備",
+        "untested": "まだ様子を見ています",
+        "unavailable": "今は接続できません"
+      },
+      "insufficientEvidence": "まだ様子を見ています",
+      "keepObserving": "もう少し使って様子を見ましょう",
+      "technicalDetails": "詳しい理由（問題の調査用）",
+      "score": "スコア {{score}}",
+      "retryRemaining": "{{seconds}} 秒後にもう一度試します",
+      "checkRecency": "{{seconds}} 秒前に確認",
+      "notChecked": "まだ確認していません"
+    },
     "modes": {
       "rule": "Rule",
       "global": "Global",

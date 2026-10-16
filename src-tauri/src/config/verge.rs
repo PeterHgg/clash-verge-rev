@@ -85,6 +85,8 @@ pub struct IVerge {
 
     pub enable_system_proxy: Option<bool>,
 
+    pub enable_load_balance_enhanced: Option<bool>,
+
     pub enable_proxy_guard: Option<bool>,
 
     pub enable_bypass_check: Option<bool>,
@@ -382,6 +384,7 @@ impl IVerge {
             enable_hover_jump_navigator: Some(true),
             hover_jump_navigator_delay: Some(280),
             enable_system_proxy: Some(false),
+            enable_load_balance_enhanced: Some(false),
             proxy_auto_config: Some(false),
             pac_file_content: Some(DEFAULT_PAC.into()),
             proxy_host: Some("127.0.0.1".into()),
@@ -484,6 +487,7 @@ impl IVerge {
         patch!(verge_port);
         patch!(verge_http_enabled);
         patch!(enable_system_proxy);
+        patch!(enable_load_balance_enhanced);
         patch!(enable_proxy_guard);
         patch!(enable_bypass_check);
         patch!(use_default_bypass);

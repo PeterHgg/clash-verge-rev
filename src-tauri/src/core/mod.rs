@@ -4,6 +4,7 @@ pub mod backup;
 pub mod hotkey;
 pub mod lightweight;
 pub mod listener;
+pub(crate) mod load_balance;
 pub mod logger;
 pub mod manager;
 #[cfg(target_os = "macos")]

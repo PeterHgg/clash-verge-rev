@@ -1,5 +1,45 @@
 {
   "page": {
+    "enhancement": {
+      "states": {
+        "warming": "還在觀察",
+        "active": "幫你挑著用",
+        "probing": "延遲檢測中",
+        "trial": "少量試用中",
+        "cooldown": "休息一下再試",
+        "draining": "等之前的連線用完",
+        "unavailable": "暫時沒有能用的節點",
+        "quarantined": "暫時停用",
+        "unsupported": "這個群組暫不支援"
+      },
+      "descriptions": {
+        "warming": "先看看各節點的表現",
+        "active": "優先使用目前合適的節點",
+        "probing": "正在重用或更新 Clash 內建的延遲測試，不額外下載測速檔案",
+        "trial": "正在少量試用一個備用節點",
+        "cooldown": "過一會兒再試，不影響其他可用節點",
+        "draining": "之前的連線還在用，等它們自然結束",
+        "unavailable": "暫時沒找到能連線的節點",
+        "quarantined": "正在確認連線狀態，暫時不再分配新連線",
+        "unsupported": "暫時沿用原來的連線方式"
+      },
+      "candidates": {
+        "probing": "檢查中",
+        "trial": "少量試用中",
+        "selected": "正在使用",
+        "cooldown": "休息一下再試",
+        "standby": "備用",
+        "untested": "還在觀察",
+        "unavailable": "暫時連不上"
+      },
+      "insufficientEvidence": "還在觀察",
+      "keepObserving": "再用一會兒看看",
+      "technicalDetails": "詳細原因（供疑難排解）",
+      "score": "{{score}} 分",
+      "retryRemaining": "{{seconds}} 秒後再試",
+      "checkRecency": "{{seconds}} 秒前檢查",
+      "notChecked": "尚未檢查"
+    },
     "modes": {
       "rule": "規則",
       "global": "全局",

@@ -16,11 +16,13 @@
         "systemProxy": "Proksi Sistem"
       },
       "tooltips": {
-        "silentStart": "Mulai program dalam mode latar belakang tanpa menampilkan panel"
+        "silentStart": "Mulai program dalam mode latar belakang tanpa menampilkan panel",
+        "loadBalanceEnhanced": "Awalnya memilih hingga 3 node yang dipastikan tersedia dengan latensi terendah, lalu lebih mengutamakan kinerja transfer nyata. Inti memilih dan menggilir node secara mandiri, meskipun jendela disembunyikan; klien hanya menampilkan hasil. Hanya memakai uji bawaan Clash pada URL yang dikonfigurasi, tanpa unduhan tambahan untuk mengukur kecepatan. Memerlukan Mihomo khusus v1.19.32-verge-adaptive1 yang disertakan dan grup yang diatur secara eksplisit sebagai round-robin. Kedua opsi adaptif memakai inti khusus yang sama. Grup yang tidak didukung tetap memakai cara semula; menonaktifkan memulihkan konfigurasi sumber. Mengubah opsi ini dapat memengaruhi koneksi sebentar."
       },
       "fields": {
         "autoLaunch": "Mulai otomatis",
-        "silentStart": "Mulai senyap"
+        "silentStart": "Mulai senyap",
+        "loadBalanceEnhanced": "Penyeimbangan Beban Lanjutan"
       },
       "notifications": {
         "tunMode": {
@@ -303,9 +305,10 @@
     },
     "clashCore": {
       "variants": {
-        "release": "Versi Rilis",
-        "alpha": "Versi Alpha"
-      }
+        "release": "Adaptif",
+        "alpha": "Adaptif (opsi kompatibilitas)"
+      },
+      "upgradeUnavailable": "Versi ini menggunakan inti khusus. Untuk memperbaruinya, instal versi aplikasi yang lebih baru dengan inti khusus."
     },
     "liteMode": {
       "title": "LightWeight Mode Settings",

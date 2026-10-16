@@ -16,11 +16,13 @@
         "systemProxy": "Systemproxy"
       },
       "tooltips": {
-        "silentStart": "Die Anwendung wird im Hintergrund gestartet, ohne dass das Programmfenster angezeigt wird."
+        "silentStart": "Die Anwendung wird im Hintergrund gestartet, ohne dass das Programmfenster angezeigt wird.",
+        "loadBalanceEnhanced": "Wählt zunächst bis zu 3 nachweislich verfügbare Knoten mit der niedrigsten Latenz, danach zählt die tatsächliche Übertragungsleistung stärker. Der Kern wählt und wechselt die Knoten selbstständig, auch bei ausgeblendetem Fenster; der Client zeigt nur die Ergebnisse. Nutzt nur die integrierten Clash-Tests mit der konfigurierten URL, ohne zusätzliche Geschwindigkeitstestdateien. Erfordert den mitgelieferten angepassten Mihomo v1.19.32-verge-adaptive1 und eine ausdrücklich als round-robin konfigurierte Gruppe. Beide adaptiven Kerneinträge verwenden denselben angepassten Kern. Nicht unterstützte Gruppen bleiben unverändert; Ausschalten stellt die Quellkonfiguration wieder her. Umschalten kann Verbindungen kurz beeinträchtigen."
       },
       "fields": {
         "autoLaunch": "Automatischer Start",
-        "silentStart": "Leiser Start"
+        "silentStart": "Leiser Start",
+        "loadBalanceEnhanced": "Erweiterte Lastverteilung"
       },
       "notifications": {
         "tunMode": {
@@ -303,9 +305,10 @@
     },
     "clashCore": {
       "variants": {
-        "release": "Stabile Version",
-        "alpha": "Alpha-Version"
-      }
+        "release": "Adaptiv",
+        "alpha": "Adaptiv (Kompatibilitätseintrag)"
+      },
+      "upgradeUnavailable": "Diese Version nutzt einen angepassten Kern. Installiere zum Aktualisieren eine neuere App-Version mit angepasstem Kern."
     },
     "liteMode": {
       "title": "Einstellungen für den Leichtgewichtigen Modus",

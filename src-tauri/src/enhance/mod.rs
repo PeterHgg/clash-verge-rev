@@ -1,6 +1,7 @@
 use crate::core::notify::NoticeStatus;
 mod chain;
 pub mod field;
+pub mod load_balance;
 mod merge;
 mod script;
 pub mod seq;
@@ -37,6 +38,7 @@ struct ConfigValues {
     clash_core: Option<String>,
     enable_tun: bool,
     enable_builtin: bool,
+    enable_load_balance: bool,
     socks_enabled: bool,
     http_enabled: bool,
     enable_dns_settings: bool,
@@ -125,6 +127,7 @@ async fn get_config_values(profile_uid: &str) -> ConfigValues {
         ..
     } = **verge_arc;
     let enable_external_controller = enable_external_controller.unwrap_or(false);
+    let enable_load_balance = verge_arc.enable_load_balance_enhanced.unwrap_or(false);
     let dns_settings = verge_arc.dns_settings_for(profile_uid);
     let dns_override_confirmation = dns_settings.confirmation;
 
@@ -151,6 +154,7 @@ async fn get_config_values(profile_uid: &str) -> ConfigValues {
         clash_core,
         enable_tun,
         enable_builtin,
+        enable_load_balance,
         socks_enabled,
         http_enabled,
         enable_dns_settings,
@@ -871,10 +875,16 @@ async fn apply_dns_settings(config: Mapping, enable_dns_settings: bool) -> (Mapp
     (config, Mapping::new())
 }
 
-/// Returns the enhanced profile, its original keys, script logs, and DNS override decision.
+/// Returns the enhanced profile and metadata to commit with the runtime draft.
 pub async fn enhance(
     profiles: &IProfiles,
-) -> Result<(Mapping, HashSet<String>, HashMap<String, ResultLog>, DnsOverrideState)> {
+) -> Result<(
+    Mapping,
+    HashSet<String>,
+    HashMap<String, ResultLog>,
+    DnsOverrideState,
+    Option<load_balance::EnhancementPlan>,
+)> {
     let profile_uid = profiles.current.as_deref().unwrap_or_default();
     let cfg_vals = get_config_values(profile_uid).await;
     let ConfigValues {
@@ -882,6 +892,7 @@ pub async fn enhance(
         clash_core,
         enable_tun,
         enable_builtin,
+        enable_load_balance,
         socks_enabled,
         http_enabled,
         enable_dns_settings,
@@ -929,6 +940,9 @@ pub async fn enhance(
         tproxy_enabled,
     );
 
+    let load_balance_core_supported = clash_core
+        .as_deref()
+        .is_some_and(|core| IVerge::VALID_CLASH_CORES.contains(&core));
     let config = apply_builtin_scripts(config, clash_core, enable_builtin);
     let config = use_tun(config, enable_tun);
     let (config, dns_settings) = apply_dns_settings(config, enable_dns_settings).await;
@@ -962,12 +976,36 @@ pub async fn enhance(
     let config = ensure_lan_bind_address(config);
 
     let config = cleanup_proxy_groups(config);
+    let (config, load_balance) = if enable_load_balance && !load_balance_core_supported {
+        let unsupported = config
+            .get("proxy-groups")
+            .and_then(Value::as_sequence)
+            .into_iter()
+            .flatten()
+            .filter(|group| group.get("type").and_then(Value::as_str) == Some("load-balance"))
+            .filter_map(|group| group.get("name").and_then(Value::as_str))
+            .map(|name| load_balance::UnsupportedGroup {
+                name: name.to_owned(),
+                reason: "Native adaptive balancing requires a bundled verge-adaptive1 core entry; original routing is retained"
+                    .into(),
+            })
+            .collect();
+        (
+            config,
+            Some(load_balance::EnhancementPlan {
+                unsupported,
+                ..Default::default()
+            }),
+        )
+    } else {
+        load_balance::transform(config, enable_load_balance)?
+    };
     let config = use_sort(config);
 
     let mut exists_keys_set = HashSet::new();
     exists_keys_set.extend(exists_keys);
 
-    Ok((config, exists_keys_set, result_map, dns_override))
+    Ok((config, exists_keys_set, result_map, dns_override, load_balance))
 }
 
 #[cfg(test)]

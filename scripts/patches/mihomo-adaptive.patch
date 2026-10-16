@@ -1,0 +1,2834 @@
+diff --git a/adapter/outboundgroup/loadbalance.go b/adapter/outboundgroup/loadbalance.go
+index c1b53e1..3cf105d 100644
+--- a/adapter/outboundgroup/loadbalance.go
++++ b/adapter/outboundgroup/loadbalance.go
+@@ -22,6 +22,7 @@ import (
+ type LoadBalanceOption struct {
+ 	Strategy string `group:"strategy,omitempty"`
+ 	HashKey  string `group:"hash-key,omitempty"`
++	Adaptive bool   `group:"adaptive,omitempty"`
+ }
+ 
+ type LoadBalance struct {
+@@ -30,6 +31,7 @@ type LoadBalance struct {
+ 	strategyFn     strategyFn
+ 	testUrl        string
+ 	expectedStatus string
++	adaptive       *adaptiveController
+ }
+ 
+ type strategyFn = func(proxies []C.Proxy, metadata *C.Metadata, touch bool) C.Proxy
+@@ -120,6 +122,22 @@ func jumpHash(key uint64, buckets int32) int32 {
+ 
+ // DialContext implements C.ProxyAdapter
+ func (lb *LoadBalance) DialContext(ctx context.Context, metadata *C.Metadata) (c C.Conn, err error) {
++	if lb.adaptive != nil {
++		admission, selectErr := lb.adaptive.admit()
++		if !errors.Is(selectErr, errAdaptiveUnsupported) {
++			if selectErr != nil {
++				return nil, selectErr
++			}
++			c, err = admission.proxy.DialContext(ctx, metadata)
++			if err != nil {
++				admission.fail(err)
++				admission.release()
++				return nil, err
++			}
++			c.AppendToChains(lb)
++			return newAdaptiveConn(c, admission, metadata), nil
++		}
++	}
+ 	proxy := lb.Unwrap(metadata, true)
+ 	c, err = proxy.DialContext(ctx, metadata)
+ 
+@@ -144,6 +162,22 @@ func (lb *LoadBalance) DialContext(ctx context.Context, metadata *C.Metadata) (c
+ 
+ // ListenPacketContext implements C.ProxyAdapter
+ func (lb *LoadBalance) ListenPacketContext(ctx context.Context, metadata *C.Metadata) (pc C.PacketConn, err error) {
++	if lb.adaptive != nil {
++		admission, selectErr := lb.adaptive.admitNetwork(true)
++		if !errors.Is(selectErr, errAdaptiveUnsupported) {
++			if selectErr != nil {
++				return nil, selectErr
++			}
++			pc, err = admission.proxy.ListenPacketContext(ctx, metadata)
++			if err != nil {
++				admission.fail(err)
++				admission.release()
++				return nil, err
++			}
++			pc.AppendToChains(lb)
++			return newAdaptivePacketConn(pc, admission, metadata), nil
++		}
++	}
+ 	defer func() {
+ 		if err == nil {
+ 			pc.AppendToChains(lb)
+@@ -252,6 +286,11 @@ func strategyStickySessions(url string, keyOf keyFn) strategyFn {
+ 
+ // Unwrap implements C.ProxyAdapter
+ func (lb *LoadBalance) Unwrap(metadata *C.Metadata, touch bool) C.Proxy {
++	if lb.adaptive != nil {
++		if proxy := lb.adaptive.preview(); proxy != nil {
++			return proxy
++		}
++	}
+ 	proxies := lb.GetProxies(touch)
+ 	return lb.strategyFn(proxies, metadata, touch)
+ }
+@@ -259,10 +298,17 @@ func (lb *LoadBalance) Unwrap(metadata *C.Metadata, touch bool) C.Proxy {
+ // MarshalJSON implements C.ProxyAdapter
+ func (lb *LoadBalance) MarshalJSON() ([]byte, error) {
+ 	var all []string
+-	for _, proxy := range lb.GetProxies(false) {
+-		all = append(all, proxy.Name())
++	var adaptive *adaptiveStatus
++	if lb.adaptive != nil {
++		status := lb.adaptive.snapshot()
++		adaptive = &status
++		all = status.all
++	} else {
++		for _, proxy := range lb.GetProxies(false) {
++			all = append(all, proxy.Name())
++		}
+ 	}
+-	return json.Marshal(map[string]any{
++	result := map[string]any{
+ 		"type":           lb.Type().String(),
+ 		"all":            all,
+ 		"testUrl":        lb.testUrl,
+@@ -270,7 +316,11 @@ func (lb *LoadBalance) MarshalJSON() ([]byte, error) {
+ 		"hidden":         lb.Hidden(),
+ 		"icon":           lb.Icon(),
+ 		"emptyFallback":  lb.EmptyFallback().Name(),
+-	})
++	}
++	if adaptive != nil {
++		result["adaptive"] = adaptive
++	}
++	return json.Marshal(result)
+ }
+ 
+ func (lb *LoadBalance) Providers() []P.ProxyProvider {
+@@ -286,6 +336,12 @@ func (lb *LoadBalance) Now() string {
+ }
+ 
+ func NewLoadBalance(option GroupCommonOption, loadBalanceOption LoadBalanceOption, emptyFallback C.Proxy, providers []P.ProxyProvider) (lb *LoadBalance, err error) {
++	if loadBalanceOption.Adaptive && loadBalanceOption.Strategy != "round-robin" {
++		return nil, fmt.Errorf("%w: adaptive requires explicit round-robin", errStrategy)
++	}
++	if loadBalanceOption.Adaptive && !option.ManualHealthCheck {
++		return nil, errors.New("adaptive requires manual-health-check: true")
++	}
+ 	var strategyFn strategyFn
+ 	withKey, err := hashKey(loadBalanceOption.HashKey)
+ 	if err != nil {
+@@ -306,7 +362,7 @@ func NewLoadBalance(option GroupCommonOption, loadBalanceOption LoadBalanceOptio
+ 	default:
+ 		return nil, fmt.Errorf("%w: %s", errStrategy, loadBalanceOption.Strategy)
+ 	}
+-	return &LoadBalance{
++	lb = &LoadBalance{
+ 		GroupBase: NewGroupBase(GroupBaseOption{
+ 			Name:              option.Name,
+ 			Type:              C.LoadBalance,
+@@ -325,5 +381,24 @@ func NewLoadBalance(option GroupCommonOption, loadBalanceOption LoadBalanceOptio
+ 		disableUDP:     option.DisableUDP,
+ 		testUrl:        option.URL,
+ 		expectedStatus: option.ExpectedStatus,
+-	}, nil
++	}
++	if loadBalanceOption.Adaptive {
++		lb.adaptive, err = newAdaptiveController(lb)
++		if err != nil {
++			return nil, err
++		}
++	}
++	return lb, nil
++}
++
++func (lb *LoadBalance) ActivateAdaptive() {
++	if lb.adaptive != nil {
++		lb.adaptive.activate()
++	}
++}
++
++func (lb *LoadBalance) RetireAdaptive() {
++	if lb.adaptive != nil {
++		lb.adaptive.retire()
++	}
+ }
+diff --git a/adapter/outboundgroup/adaptive.go b/adapter/outboundgroup/adaptive.go
+new file mode 100644
+index 0000000..4cceb27
+--- /dev/null
++++ b/adapter/outboundgroup/adaptive.go
+@@ -0,0 +1,1212 @@
++package outboundgroup
++
++import (
++	"context"
++	"errors"
++	"fmt"
++	"math"
++	"reflect"
++	"sort"
++	"sync"
++	"time"
++
++	"github.com/metacubex/mihomo/common/utils"
++	C "github.com/metacubex/mihomo/constant"
++)
++
++const (
++	adaptiveMaxMembers = 2048
++	adaptiveMaxFlows   = 2048
++	adaptiveMaxSamples = 128
++	adaptiveFreshness  = 180 * time.Second
++	adaptiveTrialTime  = 180 * time.Second
++)
++
++var errAdaptiveUnavailable = errors.New("adaptive: no confirmed available member")
++var errAdaptiveUnsupported = errors.New("adaptive: unsupported candidate source")
++
++type adaptiveSample struct {
++	flowID, cohort   uint64
++	at               time.Time
++	duration         time.Duration
++	download, upload uint64
++	flowIDs          [2]uint64
++}
++
++type adaptiveMember struct {
++	proxy                   C.Proxy
++	identity                uintptr
++	valid, confirmed, alive bool
++	checked                 time.Time
++	latency                 *float64
++	jitter                  float64
++	failures                int
++	cooldown, nextChance    time.Time
++	protected               time.Time
++	waitingSince            time.Time
++	samples                 [adaptiveMaxSamples]adaptiveSample
++	sampleCount             int
++	mean, peak, confidence  float64
++	proven                  bool
++	score                   *float64
++}
++
++type adaptiveTrial struct {
++	candidate, displaced *adaptiveMember
++	started              time.Time
++	lease                *adaptiveTrialLease
++	controls             []adaptiveTrialControl
++}
++
++type adaptiveTrialControl struct {
++	anchor    *adaptiveMember
++	reference map[adaptiveComparisonCohort]float64
++}
++
++type adaptiveController struct {
++	mu       sync.Mutex
++	lb       *LoadBalance
++	now      func() time.Time
++	expected utils.IntRanges[uint16]
++	ctx      context.Context
++	cancel   context.CancelFunc
++	active   bool
++	retired  bool
++	reason   string
++	version  uint32
++	loaded   bool
++	members  []*adaptiveMember
++	all      []string
++	selected []*adaptiveMember
++	trial    *adaptiveTrial
++	lastTick time.Time
++	cursor   uint64
++	total    uint64
++	attempts uint64
++	lease    *adaptiveTrialLease
++	flows    map[*adaptiveFlow]*adaptiveAdmission
++}
++
++type adaptiveAdmission struct {
++	controller *adaptiveController
++	member     *adaptiveMember
++	proxy      C.Proxy
++	lease      *adaptiveTrialLease
++	failed     sync.Once
++	released   sync.Once
++}
++
++// A retired trial keeps this global lease until its actual native connections close.
++type adaptiveTrialLease struct {
++	refs      int
++	admitting bool
++}
++
++var adaptiveTrialOwner struct {
++	sync.Mutex
++	lease *adaptiveTrialLease
++}
++
++func acquireAdaptiveTrial() *adaptiveTrialLease {
++	adaptiveTrialOwner.Lock()
++	defer adaptiveTrialOwner.Unlock()
++	if adaptiveTrialOwner.lease != nil {
++		return nil
++	}
++	lease := &adaptiveTrialLease{admitting: true}
++	adaptiveTrialOwner.lease = lease
++	return lease
++}
++
++func finishAdaptiveTrial(lease *adaptiveTrialLease) {
++	adaptiveTrialOwner.Lock()
++	defer adaptiveTrialOwner.Unlock()
++	lease.admitting = false
++	if lease.refs == 0 && adaptiveTrialOwner.lease == lease {
++		adaptiveTrialOwner.lease = nil
++	}
++}
++
++func adaptiveTrialDraining(lease *adaptiveTrialLease) bool {
++	adaptiveTrialOwner.Lock()
++	defer adaptiveTrialOwner.Unlock()
++	return lease != nil && adaptiveTrialOwner.lease == lease && !lease.admitting && lease.refs > 0
++}
++
++func newAdaptiveController(lb *LoadBalance) (*adaptiveController, error) {
++	expected, err := utils.NewUnsignedRanges[uint16](lb.expectedStatus)
++	if err != nil {
++		return nil, err
++	}
++	ctx, cancel := context.WithCancel(context.Background())
++	c := &adaptiveController{lb: lb, now: time.Now, expected: expected, ctx: ctx, cancel: cancel,
++		flows: make(map[*adaptiveFlow]*adaptiveAdmission)}
++	c.refreshLocked(c.now())
++	c.recomputeLocked(c.now())
++	return c, nil
++}
++
++func (c *adaptiveController) activate() {
++	c.mu.Lock()
++	if c.active || c.retired {
++		c.mu.Unlock()
++		return
++	}
++	c.active = true
++	adaptiveHealth.add(c)
++	c.mu.Unlock()
++}
++
++func (c *adaptiveController) retire() {
++	c.mu.Lock()
++	if c.retired {
++		c.mu.Unlock()
++		return
++	}
++	c.retired = true
++	c.cancel()
++	if c.trial != nil {
++		finishAdaptiveTrial(c.trial.lease)
++		c.trial = nil
++	}
++	for _, member := range c.members {
++		member.valid = false
++	}
++	c.selected = nil
++	c.flows = nil
++	c.mu.Unlock()
++	adaptiveHealth.remove(c)
++}
++
++func adaptiveIdentity(proxy C.Proxy) uintptr {
++	if proxy == nil {
++		return 0
++	}
++	value := reflect.ValueOf(proxy)
++	if value.Kind() != reflect.Pointer || value.IsNil() {
++		return 0
++	}
++	return value.Pointer()
++}
++
++func adaptiveLeaf(proxy C.Proxy) bool {
++	if proxy == nil {
++		return false
++	}
++	if _, nested := proxy.Adapter().(ProxyGroup); nested {
++		return false
++	}
++	switch proxy.Type() {
++	case C.Direct, C.Compatible, C.Reject, C.RejectDrop, C.Pass, C.PassRule, C.Rematch, C.Dns,
++		C.Selector, C.Fallback, C.URLTest, C.LoadBalance:
++		return false
++	}
++	return proxy.ProxyInfo().DialerProxy == "" && adaptiveIdentity(proxy) != 0
++}
++
++func (c *adaptiveController) refreshLocked(now time.Time) {
++	if c.retired {
++		return
++	}
++	providers := c.lb.providers
++	if len(providers) != 1 {
++		c.invalidateLocked("adaptive supports one static or proxy-provider candidate source")
++		return
++	}
++	version := providers[0].Version()
++	if c.loaded && c.version == version {
++		return
++	}
++	c.loaded, c.version = true, version
++	if c.trial != nil {
++		finishAdaptiveTrial(c.trial.lease)
++		c.trial = nil
++	}
++	for _, member := range c.members {
++		member.valid = false
++	}
++	c.members, c.selected = nil, nil
++	c.flows = make(map[*adaptiveFlow]*adaptiveAdmission)
++	c.reason = ""
++	c.all = nil
++	if providers[0].Count() > adaptiveMaxMembers {
++		c.reason = "adaptive candidate limit exceeded (2048)"
++		return
++	}
++	if providers[0].Count() == 0 {
++		c.reason = "adaptive candidate source is empty"
++		if fallback := c.lb.EmptyFallback(); fallback != nil {
++			c.all = []string{fallback.Name()}
++		}
++		return
++	}
++	proxies := c.lb.GetProxies(false)
++	if len(proxies) > adaptiveMaxMembers {
++		c.reason = "adaptive candidate limit exceeded (2048)"
++		return
++	}
++	for _, proxy := range proxies {
++		if proxy != nil {
++			c.all = append(c.all, proxy.Name())
++		}
++	}
++	seenNames := make(map[string]bool, len(proxies))
++	seenIDs := make(map[uintptr]bool, len(proxies))
++	var udpSupport *bool
++	for _, proxy := range proxies {
++		identity := adaptiveIdentity(proxy)
++		if !adaptiveLeaf(proxy) || seenNames[proxy.Name()] || seenIDs[identity] {
++			c.invalidateLocked("adaptive requires distinct, unambiguous leaf proxies without dialer-proxy")
++			return
++		}
++		if proxy.IsL3Protocol(nil) {
++			c.invalidateLocked("adaptive does not support L3 protocol members; original strategy remains active")
++			return
++		}
++		supportsUDP := proxy.SupportUDP()
++		if !c.lb.disableUDP && udpSupport != nil && *udpSupport != supportsUDP {
++			c.invalidateLocked("adaptive does not support mixed UDP capabilities; original strategy remains active")
++			return
++		}
++		udpSupport = &supportsUDP
++		seenNames[proxy.Name()], seenIDs[identity] = true, true
++		member := &adaptiveMember{proxy: proxy, identity: identity, valid: true, waitingSince: now}
++		c.readHealthLocked(member, now)
++		c.members = append(c.members, member)
++	}
++	c.lastTick = time.Time{}
++}
++
++func (c *adaptiveController) invalidateLocked(reason string) {
++	if c.trial != nil {
++		finishAdaptiveTrial(c.trial.lease)
++		c.trial = nil
++	}
++	for _, member := range c.members {
++		member.valid = false
++	}
++	c.members, c.selected, c.reason = nil, nil, reason
++	c.flows = make(map[*adaptiveFlow]*adaptiveAdmission)
++}
++
++func (c *adaptiveController) readHealthLocked(member *adaptiveMember, now time.Time) {
++	state, ok := member.proxy.ExtraDelayHistories()[c.lb.testUrl]
++	if !ok || len(state.History) == 0 {
++		return
++	}
++	last := state.History[len(state.History)-1]
++	if last.Time.IsZero() || last.Time.After(now.Add(time.Second)) || !last.Time.After(member.checked) {
++		return
++	}
++	member.checked, member.confirmed, member.alive = last.Time, true, state.Alive
++	if state.Alive && !now.Before(member.cooldown) && member.failures > 0 {
++		member.failures--
++	}
++	member.latency = nil
++	if state.Alive && last.Delay > 0 {
++		latency := float64(last.Delay)
++		member.latency = &latency
++	}
++	var sum, squares float64
++	var count int
++	for _, history := range state.History {
++		if history.Delay > 0 {
++			value := float64(history.Delay)
++			sum += value
++			squares += value * value
++			count++
++		}
++	}
++	if count > 1 && sum > 0 {
++		mean := sum / float64(count)
++		member.jitter = math.Sqrt(math.Max(0, squares/float64(count)-mean*mean)) / mean
++	}
++}
++
++func (m *adaptiveMember) available(now time.Time) bool {
++	return m.valid && m.confirmed && m.alive && now.Sub(m.checked) <= adaptiveFreshness
++}
++
++func (c *adaptiveController) preview() C.Proxy {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	now := c.now()
++	c.refreshLocked(now)
++	if c.reason != "" && !c.retired {
++		return nil
++	}
++	for _, member := range c.selected {
++		if member.available(now) {
++			return member.proxy
++		}
++	}
++	// Unwrap is also used for capability inspection, not just actual admission.
++	for _, member := range c.members {
++		if member.valid {
++			return member.proxy
++		}
++	}
++	return c.lb.EmptyFallback()
++}
++
++func (c *adaptiveController) admit() (*adaptiveAdmission, error) {
++	return c.admitNetwork(false)
++}
++
++func (c *adaptiveController) admitNetwork(udp bool) (*adaptiveAdmission, error) {
++	c.activate()
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	now := c.now()
++	c.refreshLocked(now)
++	if c.retired {
++		return nil, errAdaptiveUnavailable
++	}
++	if c.reason != "" {
++		return nil, fmt.Errorf("%w: %s", errAdaptiveUnsupported, c.reason)
++	}
++	if udp && (c.lb.disableUDP || len(c.members) == 0 || !c.members[0].proxy.SupportUDP()) {
++		return nil, C.ErrNotSupport
++	}
++	if c.lastTick.IsZero() {
++		c.recomputeLocked(now)
++	}
++	ready := false
++	for _, member := range c.selected {
++		ready = ready || member.available(now)
++	}
++	if !ready {
++		return nil, errAdaptiveUnavailable
++	}
++	c.total++
++	var member *adaptiveMember
++	var lease *adaptiveTrialLease
++	if c.trial != nil && c.attempts < c.total/20 && c.trial.candidate.available(now) {
++		member, lease = c.trial.candidate, c.trial.lease
++		c.attempts++
++		adaptiveTrialOwner.Lock()
++		lease.refs++
++		adaptiveTrialOwner.Unlock()
++	} else {
++		mains := c.selected
++		if c.trial != nil {
++			mains = mains[:len(mains)-1]
++		}
++		if len(mains) == 0 {
++			return nil, errAdaptiveUnavailable
++		}
++		for i := 0; i < len(mains); i++ {
++			index := c.cursor % uint64(len(mains))
++			c.cursor++
++			if mains[index].available(now) {
++				member = mains[index]
++				break
++			}
++		}
++		if member == nil {
++			return nil, errAdaptiveUnavailable
++		}
++	}
++	return &adaptiveAdmission{controller: c, member: member, proxy: member.proxy, lease: lease}, nil
++}
++
++func (a *adaptiveAdmission) fail(err error) {
++	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, C.ErrNotSupport) {
++		return
++	}
++	a.failed.Do(func() {
++		c := a.controller
++		c.mu.Lock()
++		defer c.mu.Unlock()
++		if c.retired || !a.member.valid {
++			return
++		}
++		now := c.now()
++		// A destination refusal/reset is not proof that the proxy itself is unavailable.
++		if c.trial != nil && c.trial.candidate == a.member {
++			c.endTrialLocked(now, false, false)
++		}
++	})
++}
++
++func adaptiveFailureBackoff(failures int) time.Duration {
++	minutes := [...]int{5, 15, 45, 120}
++	index := failures - 1
++	if index < 0 {
++		index = 0
++	}
++	if index >= len(minutes) {
++		index = len(minutes) - 1
++	}
++	return time.Duration(minutes[index]) * time.Minute
++}
++
++func (a *adaptiveAdmission) release() {
++	a.released.Do(func() {
++		if a.lease == nil {
++			return
++		}
++		adaptiveTrialOwner.Lock()
++		defer adaptiveTrialOwner.Unlock()
++		a.lease.refs--
++		if a.lease.refs == 0 && !a.lease.admitting && adaptiveTrialOwner.lease == a.lease {
++			adaptiveTrialOwner.lease = nil
++		}
++	})
++}
++
++func (a *adaptiveAdmission) registerFlow(flow *adaptiveFlow) bool {
++	c := a.controller
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	if c.retired || !a.member.valid || len(c.flows) >= adaptiveMaxFlows {
++		return false
++	}
++	c.flows[flow] = a
++	return true
++}
++
++func (a *adaptiveAdmission) finishFlow(flow *adaptiveFlow) {
++	c := a.controller
++	c.mu.Lock()
++	if _, registered := c.flows[flow]; registered {
++		c.addSampleLocked(a.member, flow.drain(c.now()))
++		delete(c.flows, flow)
++	}
++	c.mu.Unlock()
++	a.release()
++}
++
++func (a *adaptiveAdmission) flowSample(sample adaptiveSample) {
++	c := a.controller
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	c.addSampleLocked(a.member, sample)
++}
++
++func (c *adaptiveController) addSampleLocked(member *adaptiveMember, sample adaptiveSample) {
++	if c.retired || !member.valid || sample.duration <= 0 || sample.download+sample.upload == 0 {
++		return
++	}
++	if sample.duration < 100*time.Millisecond {
++		return
++	}
++	window := sample.at.Unix() / 15
++	bucket := int(window % 8)
++	if bucket < 0 {
++		bucket += 8
++	}
++	start := bucket * 16
++	upload := sample.download == 0
++	for i := start; i < start+16; i++ {
++		existing := &member.samples[i]
++		if existing.duration > 0 && existing.at.Unix()/15 == window && existing.cohort == sample.cohort && (existing.download == 0) == upload {
++			existing.download += sample.download
++			existing.upload += sample.upload
++			existing.duration += sample.duration
++			existing.at = sample.at
++			adaptiveRememberFlow(&existing.flowIDs, sample.flowID)
++			return
++		}
++	}
++	for i := start; i < start+16; i++ {
++		existing := &member.samples[i]
++		if existing.duration == 0 || existing.at.Unix()/15 != window {
++			if existing.duration == 0 {
++				member.sampleCount++
++			}
++			sample.flowIDs = [2]uint64{}
++			adaptiveRememberFlow(&sample.flowIDs, sample.flowID)
++			member.samples[i] = sample
++			return
++		}
++	}
++}
++
++func adaptiveRememberFlow(ids *[2]uint64, id uint64) {
++	if id == 0 || ids[0] == id || ids[1] == id {
++		return
++	}
++	if ids[0] == 0 {
++		ids[0] = id
++	} else if ids[1] == 0 {
++		ids[1] = id
++	}
++}
++
++func (c *adaptiveController) tick(now time.Time) {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	if c.retired {
++		return
++	}
++	c.refreshLocked(now)
++	if !c.lastTick.IsZero() && now.Sub(c.lastTick) < time.Second {
++		return
++	}
++	for flow, admission := range c.flows {
++		c.addSampleLocked(admission.member, flow.drain(now))
++	}
++	for _, member := range c.members {
++		c.readHealthLocked(member, now)
++	}
++	c.recomputeLocked(now)
++}
++
++func adaptiveRates(member *adaptiveMember, now time.Time) {
++	var weightedBytes, weightedSeconds, newest float64
++	rates := make([]float64, 0, member.sampleCount)
++	flows := make(map[uint64]bool)
++	windows := make(map[int64]bool)
++	for i := 0; i < adaptiveMaxSamples; i++ {
++		sample := member.samples[i]
++		age := math.Max(0, now.Sub(sample.at).Seconds())
++		weight := math.Exp2(-age / 300)
++		if sample.duration < 100*time.Millisecond || weight < 0.01 {
++			continue
++		}
++		bytes := sample.download
++		if sample.upload > bytes {
++			bytes = sample.upload
++		}
++		if bytes == 0 {
++			continue
++		}
++		weightedBytes += float64(bytes) * weight
++		weightedSeconds += sample.duration.Seconds() * weight
++		rates = append(rates, float64(bytes)/sample.duration.Seconds())
++		newest = math.Max(newest, weight)
++		for _, id := range sample.flowIDs {
++			if id != 0 {
++				flows[id] = true
++			}
++		}
++		windows[sample.at.Unix()/15] = true
++	}
++	member.mean, member.peak, member.confidence, member.proven = 0, 0, 0, false
++	if weightedSeconds == 0 {
++		return
++	}
++	member.mean = weightedBytes / weightedSeconds
++	sort.Float64s(rates)
++	member.peak = rates[(len(rates)-1)*9/10]
++	member.confidence = math.Min(1, float64(len(windows))/6) * math.Min(1, float64(len(flows))/3) * newest
++	member.proven = len(windows) >= 2 && len(flows) >= 2 && newest >= 0.5
++}
++
++func adaptiveQuality(value, reference float64) float64 {
++	if value <= 0 || reference <= 0 || math.IsNaN(value) || math.IsNaN(reference) || math.IsInf(value, 0) || math.IsInf(reference, 0) {
++		return 0
++	}
++	if value >= reference {
++		return 1
++	}
++	return value / reference
++}
++
++func (c *adaptiveController) recomputeLocked(now time.Time) {
++	c.lastTick = now
++	var bestMean, bestPeak float64
++	bestLatency := math.Inf(1)
++	for _, member := range c.members {
++		adaptiveRates(member, now)
++		if !member.available(now) {
++			continue
++		}
++		bestMean = math.Max(bestMean, member.mean)
++		bestPeak = math.Max(bestPeak, member.peak)
++		if member.latency != nil && *member.latency > 0 && !math.IsInf(*member.latency, 0) {
++			bestLatency = math.Min(bestLatency, *member.latency)
++		}
++	}
++	for _, member := range c.members {
++		member.score = nil
++		if !member.available(now) {
++			continue
++		}
++		latency := 0.0
++		if member.latency != nil {
++			latency = adaptiveQuality(bestLatency, *member.latency)
++		}
++		if member.latency == nil && member.mean == 0 {
++			continue
++		}
++		mean := adaptiveQuality(member.mean, bestMean)
++		peak := adaptiveQuality(member.peak, bestPeak)
++		stability := adaptiveQuality(1, 1+float64(member.failures)+member.jitter)
++		passive := 45*mean + 25*peak + 15*latency + 15*stability
++		prior := 100 * latency
++		confidence := adaptiveQuality(member.confidence, 1)
++		score := math.Min(100, prior*(1-confidence)+passive*confidence)
++		member.score = &score
++	}
++	c.pruneLocked(now)
++	if c.trial != nil {
++		if !c.trial.candidate.available(now) {
++			c.endTrialLocked(now, false, false)
++		} else if adaptiveTrialComparable(c.trial, now) {
++			c.trial.displaced.waitingSince = now
++			c.trial.displaced.nextChance = now.Add(c.chanceIntervalLocked(c.trial.displaced))
++			c.endTrialLocked(now, true, false)
++			return
++		} else if now.Sub(c.trial.started) >= adaptiveTrialTime {
++			c.endTrialLocked(now, false, false)
++			return
++		}
++	}
++	if c.trial == nil && c.total >= 20 {
++		c.startTrialLocked(now)
++	}
++}
++
++func adaptiveBetter(a, b *adaptiveMember) bool {
++	if a.score != nil && b.score != nil {
++		return *a.score > *b.score
++	}
++	if a.score != nil {
++		return true
++	}
++	if b.score != nil {
++		return false
++	}
++	return a.proxy.Name() < b.proxy.Name()
++}
++
++func (c *adaptiveController) pruneLocked(now time.Time) {
++	selected := make([]*adaptiveMember, 0, 3)
++	for _, member := range c.selected {
++		if member.available(now) {
++			selected = append(selected, member)
++		}
++	}
++	c.selected = selected
++	if c.trial != nil {
++		if !c.trial.candidate.available(now) || len(c.selected) < 3 {
++			c.endTrialLocked(now, false, false)
++		} else {
++			return
++		}
++	}
++	var ready []*adaptiveMember
++	proven := false
++	for _, member := range c.members {
++		if member.available(now) && !now.Before(member.cooldown) {
++			ready = append(ready, member)
++			proven = proven || member.proven
++		}
++	}
++	sort.SliceStable(ready, func(i, j int) bool { return adaptiveBetter(ready[i], ready[j]) })
++	if !proven {
++		var protected []*adaptiveMember
++		for _, member := range c.selected {
++			if now.Before(member.protected) {
++				protected = append(protected, member)
++			}
++		}
++		c.selected = protected
++	}
++	for _, member := range ready {
++		if len(c.selected) >= 3 {
++			break
++		}
++		if !adaptiveContains(c.selected, member) {
++			c.selected = append(c.selected, member)
++		}
++	}
++}
++
++func adaptiveContains(members []*adaptiveMember, member *adaptiveMember) bool {
++	for _, existing := range members {
++		if existing == member {
++			return true
++		}
++	}
++	return false
++}
++
++func (c *adaptiveController) chanceIntervalLocked(member *adaptiveMember) time.Duration {
++	best := 0.0
++	for _, candidate := range c.selected {
++		if candidate.score != nil {
++			best = math.Max(best, *candidate.score)
++		}
++	}
++	if member.failures > 0 || member.jitter > 0.5 || (member.score != nil && best > 0 && *member.score < best*0.5) {
++		return 600 * time.Second
++	}
++	if member.score == nil || (best > 0 && *member.score < best*0.85) {
++		return 180 * time.Second
++	}
++	return 60 * time.Second
++}
++
++func (c *adaptiveController) startTrialLocked(now time.Time) {
++	if c.trial != nil || len(c.selected) < 3 || c.reason != "" {
++		return
++	}
++	// Trials are for observed capability; latency-only startup never needs one.
++	hasEvidence := false
++	for _, member := range c.selected {
++		hasEvidence = hasEvidence || member.proven
++	}
++	if !hasEvidence {
++		return
++	}
++	weakest := -1
++	for i, member := range c.selected {
++		if now.Before(member.protected) {
++			continue
++		}
++		if weakest < 0 || adaptiveBetter(c.selected[weakest], member) {
++			weakest = i
++		}
++	}
++	if weakest < 0 {
++		return
++	}
++	var candidate *adaptiveMember
++	var priority float64
++	for _, member := range c.members {
++		if !member.available(now) || now.Before(member.cooldown) || now.Before(member.nextChance) || adaptiveContains(c.selected, member) {
++			continue
++		}
++		interval := c.chanceIntervalLocked(member)
++		overdue := math.Max(0, now.Sub(member.waitingSince).Seconds()) / interval.Seconds()
++		quality := 0.0
++		if member.score != nil {
++			quality = *member.score / 100
++		}
++		value := overdue + quality
++		if candidate == nil || value > priority {
++			candidate, priority = member, value
++		}
++	}
++	if candidate == nil {
++		return
++	}
++	lease := acquireAdaptiveTrial()
++	if lease == nil {
++		return
++	}
++	// Quota accrued before this candidate's admission is not initial trial credit.
++	c.attempts = c.total / 20
++	displaced := c.selected[weakest]
++	candidate.waitingSince = now
++	mains := make([]*adaptiveMember, 0, 3)
++	for i, member := range c.selected {
++		if i != weakest {
++			mains = append(mains, member)
++		}
++	}
++	c.selected = append(mains, candidate)
++	c.lease = lease
++	c.trial = &adaptiveTrial{candidate: candidate, displaced: displaced, started: now, lease: lease}
++	baseline := adaptiveComparisonValues(displaced, now.Add(-2*time.Minute), now)
++	for _, anchor := range mains {
++		reference := adaptiveReferenceRatios(baseline, adaptiveComparisonValues(anchor, now.Add(-2*time.Minute), now))
++		if len(reference) > 0 {
++			c.trial.controls = append(c.trial.controls, adaptiveTrialControl{anchor: anchor, reference: reference})
++		}
++	}
++}
++
++func (c *adaptiveController) endTrialLocked(now time.Time, promote, failed bool) {
++	trial := c.trial
++	if trial == nil {
++		return
++	}
++	c.trial = nil
++	finishAdaptiveTrial(trial.lease)
++	if promote {
++		trial.candidate.protected = now.Add(10 * time.Minute)
++		trial.candidate.failures = 0
++		return
++	}
++	mains := make([]*adaptiveMember, 0, 3)
++	for _, member := range c.selected {
++		if member != trial.candidate && member.available(now) {
++			mains = append(mains, member)
++		}
++	}
++	if trial.displaced != nil && trial.displaced.available(now) && !adaptiveContains(mains, trial.displaced) {
++		mains = append(mains, trial.displaced)
++	}
++	c.selected = mains
++	trial.candidate.waitingSince = now
++	trial.candidate.nextChance = now.Add(c.chanceIntervalLocked(trial.candidate))
++	if !failed && trial.candidate.cooldown.Before(now.Add(5*time.Minute)) {
++		trial.candidate.cooldown = now.Add(5 * time.Minute)
++	}
++}
++
++type adaptiveComparisonKey struct {
++	cohort uint64
++	window int64
++	upload bool
++}
++
++type adaptiveComparisonValue struct {
++	bytes, seconds float64
++	flows          map[uint64]bool
++}
++
++type adaptiveComparisonCohort struct {
++	cohort uint64
++	upload bool
++}
++
++func adaptiveComparisonValues(member *adaptiveMember, started, now time.Time) map[adaptiveComparisonKey]adaptiveComparisonValue {
++	values := make(map[adaptiveComparisonKey]adaptiveComparisonValue)
++	for i := 0; i < adaptiveMaxSamples; i++ {
++		sample := member.samples[i]
++		if sample.at.Before(started) || sample.at.After(now) || sample.duration < 100*time.Millisecond {
++			continue
++		}
++		bytes, upload := sample.download, false
++		if bytes == 0 {
++			bytes, upload = sample.upload, true
++		}
++		if bytes == 0 || sample.cohort == 0 {
++			continue
++		}
++		key := adaptiveComparisonKey{cohort: sample.cohort, window: sample.at.Unix() / 15, upload: upload}
++		value := values[key]
++		if value.flows == nil {
++			value.flows = make(map[uint64]bool)
++		}
++		for _, id := range sample.flowIDs {
++			if id != 0 {
++				value.flows[id] = true
++			}
++		}
++		value.bytes += float64(bytes)
++		value.seconds += sample.duration.Seconds()
++		values[key] = value
++	}
++	return values
++}
++
++func adaptiveReferenceRatios(baseline, anchor map[adaptiveComparisonKey]adaptiveComparisonValue) map[adaptiveComparisonCohort]float64 {
++	ratios := make(map[adaptiveComparisonCohort]float64)
++	windows := make(map[adaptiveComparisonCohort]map[int64]bool)
++	leftFlows, rightFlows := make(map[adaptiveComparisonCohort]map[uint64]bool), make(map[adaptiveComparisonCohort]map[uint64]bool)
++	for key, left := range baseline {
++		right, ok := anchor[key]
++		if !ok || left.seconds == 0 || right.seconds == 0 || right.bytes == 0 {
++			continue
++		}
++		cohort := adaptiveComparisonCohort{cohort: key.cohort, upload: key.upload}
++		if windows[cohort] == nil {
++			windows[cohort], leftFlows[cohort], rightFlows[cohort] = make(map[int64]bool), make(map[uint64]bool), make(map[uint64]bool)
++		}
++		windows[cohort][key.window] = true
++		for id := range left.flows {
++			leftFlows[cohort][id] = true
++		}
++		for id := range right.flows {
++			rightFlows[cohort][id] = true
++		}
++		ratio := (left.bytes / left.seconds) / (right.bytes / right.seconds)
++		ratios[cohort] = math.Max(ratios[cohort], ratio)
++	}
++	for cohort := range ratios {
++		if len(windows[cohort]) < 2 || len(leftFlows[cohort]) < 2 || len(rightFlows[cohort]) < 2 {
++			delete(ratios, cohort)
++		}
++	}
++	return ratios
++}
++
++func adaptiveComparisonPass(left, right map[adaptiveComparisonKey]adaptiveComparisonValue, reference map[adaptiveComparisonCohort]float64) bool {
++	windows := make(map[int64]bool)
++	matchedLeft, matchedRight := make(map[uint64]bool), make(map[uint64]bool)
++	for key, a := range left {
++		b, ok := right[key]
++		if !ok || a.seconds == 0 || b.seconds == 0 || b.bytes == 0 {
++			continue
++		}
++		ratio := 1.0
++		if reference != nil {
++			var known bool
++			ratio, known = reference[adaptiveComparisonCohort{cohort: key.cohort, upload: key.upload}]
++			if !known {
++				continue
++			}
++		}
++		if (a.bytes/a.seconds)/(b.bytes/b.seconds) < 1.1*ratio-1e-9 {
++			return false
++		}
++		for id := range a.flows {
++			matchedLeft[id] = true
++		}
++		for id := range b.flows {
++			matchedRight[id] = true
++		}
++		windows[key.window] = true
++	}
++	return len(windows) >= 2 && len(matchedLeft) >= 2 && len(matchedRight) >= 2
++}
++
++func adaptiveComparable(candidate, baseline *adaptiveMember, started, now time.Time) bool {
++	return adaptiveComparisonPass(adaptiveComparisonValues(candidate, started, now), adaptiveComparisonValues(baseline, started, now), nil)
++}
++
++func adaptiveTrialComparable(trial *adaptiveTrial, now time.Time) bool {
++	if trial.displaced != nil && adaptiveComparable(trial.candidate, trial.displaced, trial.started, now) {
++		return true
++	}
++	candidate := adaptiveComparisonValues(trial.candidate, trial.started, now)
++	for _, control := range trial.controls {
++		if !control.anchor.available(now) {
++			continue
++		}
++		anchor := adaptiveComparisonValues(control.anchor, trial.started, now)
++		if adaptiveComparisonPass(candidate, anchor, control.reference) {
++			return true
++		}
++	}
++	return false
++}
++
++type adaptiveCandidateStatus struct {
++	Name                     string   `json:"name"`
++	Score                    *float64 `json:"score"`
++	Selected                 bool     `json:"selected"`
++	Reachable                bool     `json:"reachable"`
++	FreshHealth              bool     `json:"freshHealth"`
++	Proven                   bool     `json:"proven"`
++	Confidence               float64  `json:"confidence"`
++	MeanRate                 float64  `json:"meanRate"`
++	PeakRate                 float64  `json:"peakRate"`
++	LatencyMs                *float64 `json:"latencyMs"`
++	State                    string   `json:"state"`
++	CooldownRemainingSeconds *uint32  `json:"cooldownRemainingSeconds"`
++	LastCheckedSecondsAgo    *uint32  `json:"lastCheckedSecondsAgo"`
++}
++
++type adaptiveStatus struct {
++	all           []string
++	SchemaVersion int                       `json:"schemaVersion"`
++	Capability    string                    `json:"capability"`
++	State         string                    `json:"state"`
++	Reason        *string                   `json:"reason"`
++	Candidates    []adaptiveCandidateStatus `json:"candidates"`
++}
++
++func adaptiveSeconds(duration time.Duration) *uint32 {
++	seconds := uint32(math.Min(math.Max(0, duration.Seconds()), math.MaxUint32))
++	return &seconds
++}
++
++func (c *adaptiveController) snapshot() adaptiveStatus {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	now := c.now()
++	c.refreshLocked(now)
++	status := adaptiveStatus{all: append([]string(nil), c.all...), SchemaVersion: 1, Capability: "verge-adaptive1", State: "warming", Candidates: make([]adaptiveCandidateStatus, 0, len(c.members))}
++	if c.retired || c.reason != "" {
++		status.State = "unsupported"
++		reason := c.reason
++		if c.retired {
++			reason = "adaptive group retired"
++		}
++		status.Reason = &reason
++	} else if c.trial != nil {
++		status.State = "trial"
++	} else if adaptiveTrialDraining(c.lease) {
++		status.State = "draining"
++	} else {
++		ready, allConfirmed := false, len(c.members) > 0
++		for _, member := range c.selected {
++			ready = ready || member.available(now)
++		}
++		for _, member := range c.members {
++			allConfirmed = allConfirmed && member.confirmed
++		}
++		if ready {
++			status.State = "active"
++		} else if allConfirmed {
++			status.State = "unavailable"
++		}
++	}
++	for _, member := range c.members {
++		selected := adaptiveContains(c.selected, member) && member.available(now)
++		candidate := adaptiveCandidateStatus{Name: member.proxy.Name(), Score: member.score, Selected: selected,
++			Reachable: member.available(now), FreshHealth: member.available(now), Proven: member.proven,
++			Confidence: member.confidence, MeanRate: member.mean, PeakRate: member.peak, LatencyMs: member.latency, State: "standby"}
++		switch {
++		case c.trial != nil && c.trial.candidate == member:
++			candidate.State = "trial"
++		case selected:
++			candidate.State = "selected"
++		case now.Before(member.cooldown):
++			candidate.State = "cooldown"
++		case !member.confirmed:
++			candidate.State = "untested"
++		case !member.available(now):
++			candidate.State = "unavailable"
++		}
++		if !member.checked.IsZero() {
++			candidate.LastCheckedSecondsAgo = adaptiveSeconds(now.Sub(member.checked))
++		}
++		if now.Before(member.cooldown) {
++			candidate.CooldownRemainingSeconds = adaptiveSeconds(member.cooldown.Sub(now))
++		}
++		status.Candidates = append(status.Candidates, candidate)
++	}
++	return status
++}
++
++// The registry has one scheduler and at most one native URLTest in flight globally.
++var adaptiveHealth = adaptiveHealthRegistry{wake: make(chan struct{}, 1)}
++
++type adaptiveHealthRegistry struct {
++	mu       sync.Mutex
++	groups   []*adaptiveController
++	cursor   int
++	running  bool
++	inFlight bool
++	lastTest time.Time
++	wake     chan struct{}
++}
++
++func (r *adaptiveHealthRegistry) notify() {
++	select {
++	case r.wake <- struct{}{}:
++	default:
++	}
++}
++
++func (r *adaptiveHealthRegistry) add(c *adaptiveController) {
++	r.mu.Lock()
++	r.groups = append(r.groups, c)
++	if !r.running {
++		r.running = true
++		go r.run()
++	}
++	r.mu.Unlock()
++	r.notify()
++}
++
++func (r *adaptiveHealthRegistry) remove(c *adaptiveController) {
++	r.mu.Lock()
++	for i, group := range r.groups {
++		if group == c {
++			r.groups = append(r.groups[:i], r.groups[i+1:]...)
++			break
++		}
++	}
++	r.mu.Unlock()
++	r.notify()
++}
++
++func (r *adaptiveHealthRegistry) run() {
++	ticker := time.NewTicker(time.Second)
++	defer ticker.Stop()
++	for {
++		select {
++		case <-ticker.C:
++		case <-r.wake:
++		}
++		r.mu.Lock()
++		if len(r.groups) == 0 && !r.inFlight {
++			r.running = false
++			r.mu.Unlock()
++			return
++		}
++		groups := append([]*adaptiveController(nil), r.groups...)
++		cursor, busy, lastTest := r.cursor, r.inFlight, r.lastTest
++		r.mu.Unlock()
++		now := time.Now()
++		for _, group := range groups {
++			group.tick(now)
++		}
++		if busy || len(groups) == 0 || now.Sub(lastTest) < time.Second {
++			continue
++		}
++		for i := 0; i < len(groups); i++ {
++			index := (cursor + i) % len(groups)
++			group := groups[index]
++			member := group.healthCandidate(now)
++			if member == nil {
++				continue
++			}
++			r.mu.Lock()
++			r.inFlight = true
++			r.lastTest = now
++			r.cursor = (index + 1) % len(groups)
++			r.mu.Unlock()
++			go func() {
++				group.checkHealth(member)
++				r.mu.Lock()
++				r.inFlight = false
++				r.mu.Unlock()
++				r.notify()
++			}()
++			break
++		}
++	}
++}
++
++func (c *adaptiveController) healthCandidate(now time.Time) *adaptiveMember {
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	if c.retired || c.reason != "" {
++		return nil
++	}
++	var candidate *adaptiveMember
++	var priority float64
++	for _, member := range c.members {
++		interval := c.chanceIntervalLocked(member)
++		selected := adaptiveContains(c.selected, member)
++		if selected {
++			interval = 60 * time.Second
++		}
++		value := now.Sub(member.checked).Seconds() / interval.Seconds()
++		if !member.confirmed {
++			value = 100
++		} else if value < 1 {
++			continue
++		} else if selected {
++			value += 10000
++		}
++		if candidate == nil || value > priority {
++			candidate, priority = member, value
++		}
++	}
++	return candidate
++}
++
++func (c *adaptiveController) checkHealth(member *adaptiveMember) {
++	timeout := time.Duration(c.lb.testTimeout) * time.Millisecond
++	if timeout < time.Millisecond {
++		timeout = time.Millisecond
++	}
++	if timeout > 5*time.Second {
++		timeout = 5 * time.Second
++	}
++	ctx, cancel := context.WithTimeout(c.ctx, timeout)
++	defer cancel()
++	if ctx.Err() != nil {
++		return
++	}
++	_, err := member.proxy.URLTest(ctx, c.lb.testUrl, c.expected)
++	c.mu.Lock()
++	defer c.mu.Unlock()
++	if c.retired || !member.valid || c.ctx.Err() != nil {
++		return
++	}
++	now := c.now()
++	previous := member.checked
++	c.readHealthLocked(member, now)
++	if !member.checked.After(previous) {
++		// Native URLTest normally writes this history; missing exact history is never success.
++		member.checked, member.confirmed, member.alive = now, true, false
++	}
++	if err != nil || !member.alive {
++		member.alive = false
++		member.failures++
++		member.cooldown = now.Add(adaptiveFailureBackoff(member.failures))
++	}
++	c.lastTick = time.Time{}
++}
+diff --git a/adapter/outboundgroup/adaptive_test.go b/adapter/outboundgroup/adaptive_test.go
+new file mode 100644
+index 0000000..e0b678c
+--- /dev/null
++++ b/adapter/outboundgroup/adaptive_test.go
+@@ -0,0 +1,714 @@
++package outboundgroup
++
++import (
++	"context"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"math"
++	"sync"
++	"testing"
++	"time"
++
++	"github.com/metacubex/mihomo/adapter"
++	"github.com/metacubex/mihomo/adapter/outbound"
++	"github.com/metacubex/mihomo/common/utils"
++	C "github.com/metacubex/mihomo/constant"
++	P "github.com/metacubex/mihomo/constant/provider"
++	"github.com/stretchr/testify/require"
++)
++
++type adaptivePolicyProxy struct {
++	C.Proxy
++	mu      sync.Mutex
++	name    string
++	history map[string]C.ProxyState
++	tests   int
++	testURL string
++	status  utils.IntRanges[uint16]
++	testErr error
++	dials   int
++	dialErr error
++	l3      bool
++	noUDP   bool
++}
++
++func (p *adaptivePolicyProxy) IsL3Protocol(*C.Metadata) bool { return p.l3 }
++func (p *adaptivePolicyProxy) SupportUDP() bool              { return !p.noUDP }
++
++func (p *adaptivePolicyProxy) Name() string        { return p.name }
++func (p *adaptivePolicyProxy) Type() C.AdapterType { return C.Shadowsocks }
++func (p *adaptivePolicyProxy) ExtraDelayHistories() map[string]C.ProxyState {
++	p.mu.Lock()
++	defer p.mu.Unlock()
++	copy := make(map[string]C.ProxyState)
++	for url, state := range p.history {
++		copy[url] = state
++	}
++	return copy
++}
++func (p *adaptivePolicyProxy) setHealth(url string, at time.Time, alive bool, delay uint16) {
++	p.mu.Lock()
++	defer p.mu.Unlock()
++	p.history[url] = C.ProxyState{Alive: alive, History: []C.DelayHistory{{Time: at, Delay: delay}}}
++}
++func (p *adaptivePolicyProxy) URLTest(ctx context.Context, url string, status utils.IntRanges[uint16]) (uint16, error) {
++	p.mu.Lock()
++	p.tests++
++	p.testURL, p.status = url, status
++	err := p.testErr
++	p.mu.Unlock()
++	p.setHealth(url, time.Now(), err == nil, 0)
++	return 0, err
++}
++func (p *adaptivePolicyProxy) DialContext(context.Context, *C.Metadata) (C.Conn, error) {
++	p.mu.Lock()
++	defer p.mu.Unlock()
++	p.dials++
++	return nil, p.dialErr
++}
++
++type adaptivePolicyProvider struct {
++	P.ProxyProvider
++	mu      sync.Mutex
++	proxies []C.Proxy
++	version uint32
++}
++
++func (p *adaptivePolicyProvider) Touch() {}
++
++func (p *adaptivePolicyProvider) Version() uint32 {
++	p.mu.Lock()
++	defer p.mu.Unlock()
++	return p.version
++}
++func (p *adaptivePolicyProvider) Proxies() []C.Proxy {
++	p.mu.Lock()
++	defer p.mu.Unlock()
++	return append([]C.Proxy(nil), p.proxies...)
++}
++func (p *adaptivePolicyProvider) Count() int {
++	p.mu.Lock()
++	defer p.mu.Unlock()
++	return len(p.proxies)
++}
++func (p *adaptivePolicyProvider) replace(proxies []C.Proxy) {
++	p.mu.Lock()
++	defer p.mu.Unlock()
++	p.proxies = proxies
++	p.version++
++}
++
++func adaptivePolicyFixture(t *testing.T, delays ...uint16) (*LoadBalance, *adaptivePolicyProvider, []*adaptivePolicyProxy, *time.Time) {
++	t.Helper()
++	now := time.Now().Truncate(time.Second)
++	provider := &adaptivePolicyProvider{version: 1}
++	var proxies []*adaptivePolicyProxy
++	for i, delay := range delays {
++		proxy := &adaptivePolicyProxy{Proxy: adapter.NewProxy(outbound.NewDirect()), name: fmt.Sprintf("node-%d", i), history: make(map[string]C.ProxyState)}
++		proxy.setHealth(testUrl, now, true, delay)
++		proxies = append(proxies, proxy)
++		provider.proxies = append(provider.proxies, proxy)
++	}
++	lb, err := NewLoadBalance(GroupCommonOption{Name: "adaptive", URL: testUrl, ExpectedStatus: "204", ManualHealthCheck: true},
++		LoadBalanceOption{Strategy: "round-robin", Adaptive: true}, adapter.NewProxy(outbound.NewDirect()), []P.ProxyProvider{provider})
++	require.NoError(t, err)
++	lb.adaptive.now = func() time.Time { return now }
++	lb.adaptive.recomputeLocked(now)
++	// Model tests drive ticks themselves and never start background/network work.
++	lb.adaptive.active = true
++	t.Cleanup(lb.RetireAdaptive)
++	return lb, provider, proxies, &now
++}
++
++func adaptivePolicyNames(members []*adaptiveMember) []string {
++	names := make([]string, len(members))
++	for i, member := range members {
++		names[i] = member.proxy.Name()
++	}
++	return names
++}
++
++func adaptivePolicyEvidence(c *adaptiveController, member *adaptiveMember, at time.Time, rate uint64, firstID uint64) {
++	for i := 0; i < 6; i++ {
++		c.addSampleLocked(member, adaptiveSample{flowID: firstID + uint64(i%3), cohort: 99,
++			at: at.Add(time.Duration(i) * 15 * time.Second), duration: time.Second, download: rate})
++	}
++}
++
++func TestAdaptiveColdSelectionAndPreviewDoesNotAdmit(t *testing.T) {
++	lb, _, _, _ := adaptivePolicyFixture(t, 90, 10, 70, 30, 20)
++	c := lb.adaptive
++	require.Equal(t, []string{"node-1", "node-4", "node-3"}, adaptivePolicyNames(c.selected))
++	for i := 0; i < 100; i++ {
++		require.Equal(t, "node-1", lb.Unwrap(nil, i%2 == 0).Name())
++		_, err := lb.MarshalJSON()
++		require.NoError(t, err)
++	}
++	require.Zero(t, c.total)
++	require.Zero(t, c.attempts)
++	for i := 0; i < 9; i++ {
++		a, err := c.admit()
++		require.NoError(t, err)
++		require.Equal(t, []string{"node-1", "node-4", "node-3"}[i%3], a.proxy.Name())
++		a.release()
++	}
++}
++
++func TestAdaptiveConfirmedHealthAndZeroLatency(t *testing.T) {
++	for _, count := range []int{1, 2} {
++		t.Run(fmt.Sprint(count), func(t *testing.T) {
++			delays := make([]uint16, count)
++			lb, _, _, _ := adaptivePolicyFixture(t, delays...)
++			a, err := lb.adaptive.admit()
++			require.NoError(t, err)
++			a.release()
++			status := lb.adaptive.snapshot()
++			require.Equal(t, "active", status.State)
++			require.Len(t, lb.adaptive.selected, count)
++			for _, candidate := range status.Candidates {
++				require.Nil(t, candidate.LatencyMs)
++				require.Nil(t, candidate.Score)
++				require.True(t, candidate.Reachable)
++			}
++		})
++	}
++	lb, provider, proxies, now := adaptivePolicyFixture(t, 10, 20)
++	for _, proxy := range proxies {
++		proxy.setHealth(testUrl, now.Add(time.Second), false, 0)
++	}
++	*now = now.Add(time.Second)
++	lb.adaptive.tick(*now)
++	_, err := lb.adaptive.admit()
++	require.ErrorIs(t, err, errAdaptiveUnavailable)
++	require.Empty(t, lb.adaptive.selected)
++	require.Equal(t, "unavailable", lb.adaptive.snapshot().State)
++	unknown := &adaptivePolicyProxy{Proxy: adapter.NewProxy(outbound.NewDirect()), name: "unknown", history: make(map[string]C.ProxyState)}
++	unknown.setHealth("https://other.invalid/", *now, true, 5)
++	provider.replace([]C.Proxy{unknown})
++	_, err = lb.adaptive.admit()
++	require.ErrorIs(t, err, errAdaptiveUnavailable)
++	require.Equal(t, "unknown", lb.Unwrap(nil, false).Name())
++	require.Equal(t, "warming", lb.adaptive.snapshot().State)
++}
++
++func TestAdaptiveQualityBounds(t *testing.T) {
++	for _, test := range []struct {
++		name             string
++		value, reference float64
++		want             float64
++	}{
++		{"relative", 10, 1000, 0.01},
++		{"equal", 10, 10, 1},
++		{"old-fast", 1000, 10, 1},
++		{"zero-value", 0, 10, 0},
++		{"zero-reference", 10, 0, 0},
++		{"negative-value", -10, 10, 0},
++		{"negative-reference", 10, -10, 0},
++		{"nan-value", math.NaN(), 10, 0},
++		{"nan-reference", 10, math.NaN(), 0},
++		{"infinite-value", math.Inf(1), 10, 0},
++		{"infinite-reference", 10, math.Inf(1), 0},
++		{"negative-infinite-value", math.Inf(-1), 10, 0},
++		{"negative-infinite-reference", 10, math.Inf(-1), 0},
++		{"overflow-ratio", math.MaxFloat64, math.SmallestNonzeroFloat64, 1},
++	} {
++		t.Run(test.name, func(t *testing.T) {
++			quality := adaptiveQuality(test.value, test.reference)
++			require.Equal(t, test.want, quality)
++			score := 45*quality + 25*quality + 15*quality + 15*quality
++			require.False(t, math.IsNaN(score) || math.IsInf(score, 0))
++			require.GreaterOrEqual(t, score, 0.0)
++			require.LessOrEqual(t, score, 100.0)
++			_, err := json.Marshal(score)
++			require.NoError(t, err)
++		})
++	}
++}
++
++func TestAdaptiveStaleFastMemberScoreBounds(t *testing.T) {
++	for _, scenario := range []string{"stale", "dead", "stale-cooldown", "fresh-cooldown"} {
++		t.Run(scenario, func(t *testing.T) {
++			lb, _, _, now := adaptivePolicyFixture(t, 10, 1000)
++			c := lb.adaptive
++			oldFast, active := c.members[0], c.members[1]
++			c.selected = []*adaptiveMember{active}
++			switch scenario {
++			case "stale", "stale-cooldown":
++				oldFast.checked = now.Add(-adaptiveFreshness - time.Second)
++			case "dead":
++				oldFast.alive = false
++			}
++			if scenario == "stale-cooldown" || scenario == "fresh-cooldown" {
++				oldFast.cooldown = now.Add(time.Minute)
++				oldFast.failures = 2
++			}
++			c.recomputeLocked(*now)
++			require.Equal(t, []*adaptiveMember{active}, c.selected)
++			status := c.snapshot()
++			require.Equal(t, "active", status.State)
++			for _, candidate := range status.Candidates {
++				if candidate.Score != nil {
++					require.False(t, math.IsNaN(*candidate.Score) || math.IsInf(*candidate.Score, 0))
++					require.GreaterOrEqual(t, *candidate.Score, 0.0)
++					require.LessOrEqual(t, *candidate.Score, 100.0)
++				}
++			}
++			if scenario != "fresh-cooldown" {
++				require.Nil(t, status.Candidates[0].Score, "unavailable old RTT is not current quality")
++				require.Equal(t, 100.0, *status.Candidates[1].Score)
++			}
++			require.True(t, status.Candidates[1].Selected)
++			wire, err := lb.MarshalJSON()
++			require.NoError(t, err)
++			require.True(t, json.Valid(wire))
++		})
++	}
++}
++
++func TestAdaptiveUnavailableBandwidthDoesNotNormalizeActiveScore(t *testing.T) {
++	lb, _, _, now := adaptivePolicyFixture(t, 10, 1000)
++	c := lb.adaptive
++	oldFast, active := c.members[0], c.members[1]
++	adaptivePolicyEvidence(c, oldFast, now.Add(-75*time.Second), 10000, 1)
++	adaptivePolicyEvidence(c, active, now.Add(-75*time.Second), 100, 11)
++	oldFast.checked = now.Add(-adaptiveFreshness - time.Second)
++	c.recomputeLocked(*now)
++	require.Nil(t, oldFast.score)
++	require.Equal(t, 100.0, *active.score)
++	require.Equal(t, []*adaptiveMember{active}, c.selected)
++	wire, err := lb.MarshalJSON()
++	require.NoError(t, err)
++	require.True(t, json.Valid(wire))
++}
++
++func TestAdaptivePassiveWeightsConfidenceAndIdle(t *testing.T) {
++	lb, _, _, now := adaptivePolicyFixture(t, 10, 30, 40, 50)
++	c := lb.adaptive
++	start := now.Add(-75 * time.Second)
++	for i, member := range c.members {
++		rate := uint64(100)
++		if i == 1 {
++			rate = 1000
++		}
++		adaptivePolicyEvidence(c, member, start, rate, uint64(i*10+1))
++	}
++	c.recomputeLocked(*now)
++	for _, member := range c.members {
++		latency := 10 / *member.latency
++		passive := 45*(member.mean/c.members[1].mean) + 25*(member.peak/c.members[1].peak) + 15*latency + 15
++		want := 100*latency*(1-member.confidence) + passive*member.confidence
++		require.InDelta(t, want, *member.score, 1e-12, "45/25/15/15 weights and confidence blend must remain unchanged")
++	}
++	require.Greater(t, *c.members[1].score, *c.members[0].score, "observed throughput must outweigh single low RTT")
++	beforeMean, beforeConfidence := c.members[1].mean, c.members[1].confidence
++	adaptiveRates(c.members[1], now.Add(5*time.Minute))
++	require.InDelta(t, beforeMean, c.members[1].mean, 0.001, "idle is not a zero-rate observation")
++	require.InDelta(t, beforeConfidence/2, c.members[1].confidence, 0.001)
++	c.addSampleLocked(c.members[1], adaptiveSample{at: *now, duration: time.Second})
++	require.Equal(t, 6, c.members[1].sampleCount)
++}
++
++func TestAdaptiveTrialQuotaRollbackProtectionAndGlobalDrain(t *testing.T) {
++	lb, _, _, now := adaptivePolicyFixture(t, 10, 20, 30, 40, 50)
++	c := lb.adaptive
++	for i := 0; i < 3; i++ {
++		adaptivePolicyEvidence(c, c.members[i], now.Add(-75*time.Second), uint64(300-i*50), uint64(10*i+1))
++	}
++	c.recomputeLocked(*now)
++	for i := 0; i < 19; i++ {
++		a, err := c.admit()
++		require.NoError(t, err)
++		require.Nil(t, a.lease)
++		a.release()
++	}
++	c.tick(now.Add(time.Second))
++	require.Nil(t, c.trial, "no initial quota credit")
++	a, err := c.admit()
++	require.NoError(t, err)
++	a.release()
++	*now = now.Add(2 * time.Second)
++	c.tick(*now)
++	require.NotNil(t, c.trial)
++	candidate, displaced := c.trial.candidate, c.trial.displaced
++	require.Len(t, c.selected, 3)
++	require.NotContains(t, c.selected, displaced)
++	var held []*adaptiveAdmission
++	for i := 0; i < 181; i++ {
++		a, err := c.admit()
++		require.NoError(t, err)
++		if a.lease != nil {
++			held = append(held, a)
++		} else {
++			a.release()
++		}
++		require.LessOrEqual(t, c.attempts, c.total/20)
++	}
++	require.Equal(t, 9, len(held))
++	lease := held[0].lease
++	*now = now.Add(180 * time.Second)
++	// Keep native health current; expiry itself should not cause the rollback.
++	for _, member := range c.members {
++		member.checked = *now
++	}
++	c.recomputeLocked(*now)
++	require.Nil(t, c.trial)
++	require.Contains(t, c.selected, displaced)
++	require.NotContains(t, c.selected, candidate)
++	require.Equal(t, now.Add(5*time.Minute), candidate.cooldown)
++	require.Nil(t, acquireAdaptiveTrial(), "old native trial connections still own global lease")
++	for _, admission := range held {
++		admission.release()
++		admission.release()
++	}
++	require.Zero(t, lease.refs)
++	newLease := acquireAdaptiveTrial()
++	require.NotNil(t, newLease)
++	finishAdaptiveTrial(newLease)
++
++	candidate.cooldown, candidate.nextChance = time.Time{}, time.Time{}
++	c.startTrialLocked(*now)
++	require.NotNil(t, c.trial)
++	candidate, displaced = c.trial.candidate, c.trial.displaced
++	started := c.trial.started
++	for i := 0; i < 2; i++ {
++		at := started.Add(time.Duration(i+1) * 16 * time.Second)
++		c.addSampleLocked(candidate, adaptiveSample{flowID: uint64(500 + i), cohort: 77, at: at, duration: time.Second, download: 110})
++		c.addSampleLocked(displaced, adaptiveSample{flowID: uint64(600 + i), cohort: 77, at: at, duration: time.Second, download: 100})
++	}
++	*now = started.Add(33 * time.Second)
++	for _, member := range c.members {
++		member.checked = *now
++	}
++	c.recomputeLocked(*now)
++	require.Nil(t, c.trial)
++	require.Equal(t, now.Add(10*time.Minute), candidate.protected)
++	c.total = 500
++	c.startTrialLocked(*now)
++	if c.trial != nil {
++		require.NotSame(t, candidate, c.trial.displaced)
++	}
++}
++
++func TestAdaptiveComparableRequiresIndependentWindowsFlowsAndCohorts(t *testing.T) {
++	lb, _, _, now := adaptivePolicyFixture(t, 10, 20)
++	c, candidate, baseline := lb.adaptive, lb.adaptive.members[0], lb.adaptive.members[1]
++	for i := 0; i < 2; i++ {
++		at := now.Add(time.Duration(i) * 16 * time.Second)
++		c.addSampleLocked(candidate, adaptiveSample{flowID: 1, cohort: 1, at: at, duration: time.Second, download: 1000})
++		c.addSampleLocked(baseline, adaptiveSample{flowID: uint64(3 + i), cohort: 1, at: at, duration: time.Second, download: 100})
++	}
++	require.False(t, adaptiveComparable(candidate, baseline, *now, now.Add(time.Minute)), "one fast connection is not independent evidence")
++	c.addSampleLocked(candidate, adaptiveSample{flowID: 2, cohort: 2, at: now.Add(16 * time.Second), duration: time.Second, download: 1000})
++	require.False(t, adaptiveComparable(candidate, baseline, *now, now.Add(time.Minute)), "different target must not make unmatched traffic comparable")
++}
++
++func TestAdaptiveProviderReplacementRevokesOldIdentityAndNestedSource(t *testing.T) {
++	lb, provider, proxies, now := adaptivePolicyFixture(t, 10, 20, 30, 40)
++	c := lb.adaptive
++	old := c.members[0]
++	adaptivePolicyEvidence(c, old, now.Add(-75*time.Second), 1000, 1)
++	replacement := &adaptivePolicyProxy{Proxy: adapter.NewProxy(outbound.NewDirect()), name: proxies[0].name, history: make(map[string]C.ProxyState)}
++	provider.replace([]C.Proxy{replacement})
++	c.tick(now.Add(time.Second))
++	require.False(t, old.valid)
++	require.Len(t, c.members, 1)
++	require.Zero(t, c.members[0].sampleCount)
++	require.False(t, c.members[0].confirmed)
++	a := &adaptiveAdmission{controller: c, member: old, proxy: old.proxy}
++	a.fail(errors.New("old connection reset"))
++	a.flowSample(adaptiveSample{at: *now, flowID: 1, duration: time.Second, download: 1000})
++	require.Zero(t, c.members[0].failures)
++	require.Zero(t, c.members[0].sampleCount)
++	provider.replace([]C.Proxy{replacement, replacement})
++	c.tick(now.Add(2 * time.Second))
++	require.Equal(t, "unsupported", c.snapshot().State)
++	require.Empty(t, c.selected)
++}
++
++func TestAdaptiveWeightedChanceBackoffBoundedSamplesAndWire(t *testing.T) {
++	lb, _, _, now := adaptivePolicyFixture(t, 10, 20, 30, 15, 1000)
++	c := lb.adaptive
++	good, poor := c.members[3], c.members[4]
++	require.Equal(t, 180*time.Second, c.chanceIntervalLocked(good))
++	require.Equal(t, 600*time.Second, c.chanceIntervalLocked(poor))
++	for i, duration := range []time.Duration{5 * time.Minute, 15 * time.Minute, 45 * time.Minute, 120 * time.Minute, 120 * time.Minute} {
++		require.Equal(t, duration, adaptiveFailureBackoff(i+1))
++	}
++	for i := 0; i < 1000; i++ {
++		c.addSampleLocked(good, adaptiveSample{at: *now, flowID: uint64(i), duration: time.Second, download: 1})
++	}
++	require.Equal(t, 1, good.sampleCount, "high-fanout same cohort/window is one bounded aggregate")
++	poor.checked, poor.failures = now.Add(-601*time.Second), 4
++	for _, member := range c.members[:4] {
++		member.checked = *now
++	}
++	require.Same(t, poor, c.healthCandidate(*now), "poor nodes retain a rare recovery health opportunity")
++	bytes, err := lb.MarshalJSON()
++	require.NoError(t, err)
++	var wire map[string]any
++	require.NoError(t, json.Unmarshal(bytes, &wire))
++	envelope := wire["adaptive"].(map[string]any)
++	require.Equal(t, "verge-adaptive1", envelope["capability"])
++	require.EqualValues(t, 1, envelope["schemaVersion"])
++	require.NotContains(t, string(bytes), "cohort")
++	require.NotContains(t, string(bytes), "flowID")
++}
++
++func TestAdaptiveOptionAndValidationHasNoHealthSideEffects(t *testing.T) {
++	for _, strategy := range []string{"", "consistent-hashing", "sticky-sessions"} {
++		_, err := NewLoadBalance(GroupCommonOption{}, LoadBalanceOption{Strategy: strategy, Adaptive: true}, nil, nil)
++		require.ErrorIs(t, err, errStrategy)
++	}
++	_, err := NewLoadBalance(GroupCommonOption{}, LoadBalanceOption{Strategy: "round-robin", Adaptive: true}, nil, nil)
++	require.ErrorContains(t, err, "manual-health-check")
++	lb, _, proxies, _ := adaptivePolicyFixture(t, 10)
++	for i := 0; i < 10; i++ {
++		_, err := lb.MarshalJSON()
++		require.NoError(t, err)
++		lb.Unwrap(nil, true)
++	}
++	proxies[0].mu.Lock()
++	require.Zero(t, proxies[0].tests)
++	proxies[0].mu.Unlock()
++	plain, err := NewLoadBalance(GroupCommonOption{Name: "plain"}, LoadBalanceOption{Strategy: "round-robin"}, nil, nil)
++	require.NoError(t, err)
++	require.Nil(t, plain.adaptive)
++}
++
++func TestAdaptiveWeightedTrialRareRecoveryAndFailedReservation(t *testing.T) {
++	lb, _, _, now := adaptivePolicyFixture(t, 10, 20, 30, 40, 1000)
++	c := lb.adaptive
++	for i := 0; i < 3; i++ {
++		adaptivePolicyEvidence(c, c.members[i], now.Add(-75*time.Second), 200, uint64(i*10+1))
++	}
++	c.recomputeLocked(*now)
++	c.total = 1000
++	good, poor := c.members[3], c.members[4]
++	good.waitingSince, poor.waitingSince = now.Add(-time.Minute), now.Add(-20*time.Minute)
++	c.startTrialLocked(*now)
++	require.NotNil(t, c.trial)
++	require.Same(t, poor, c.trial.candidate, "low-ranked candidate gets an overdue recovery chance")
++	for i := 0; i < 19; i++ {
++		a, err := c.admit()
++		require.NoError(t, err)
++		require.Nil(t, a.lease)
++		a.release()
++	}
++	a, err := c.admit()
++	require.NoError(t, err)
++	require.NotNil(t, a.lease)
++	attempts := c.attempts
++	a.fail(errors.New("trial dial failed"))
++	a.release()
++	require.Nil(t, c.trial)
++	require.Equal(t, attempts, c.attempts, "failed trial dial does not refund selection attempt")
++	require.Equal(t, now.Add(5*time.Minute), poor.cooldown)
++	require.Contains(t, c.selected, c.members[2])
++	c.startTrialLocked(*now)
++	require.NotNil(t, c.trial)
++	require.Same(t, good, c.trial.candidate)
++	admission, err := c.admit()
++	require.NoError(t, err)
++	require.Nil(t, admission.lease)
++	admission.release()
++	c.retire()
++	lease := acquireAdaptiveTrial()
++	require.NotNil(t, lease)
++	finishAdaptiveTrial(lease)
++}
++
++func TestAdaptiveRetirementKeepsTrialLeaseUntilNativeClose(t *testing.T) {
++	lb, _, _, now := adaptivePolicyFixture(t, 10, 20, 30, 40)
++	c := lb.adaptive
++	for i := 0; i < 3; i++ {
++		adaptivePolicyEvidence(c, c.members[i], now.Add(-75*time.Second), 200, uint64(i*10+1))
++	}
++	c.recomputeLocked(*now)
++	c.total = 20
++	c.startTrialLocked(*now)
++	var held *adaptiveAdmission
++	for i := 0; i < 20; i++ {
++		a, err := c.admit()
++		require.NoError(t, err)
++		if a.lease != nil {
++			held = a
++		} else {
++			a.release()
++		}
++	}
++	require.NotNil(t, held)
++	lease := held.lease
++	c.retire()
++	require.Nil(t, acquireAdaptiveTrial())
++	held.fail(errors.New("old transport reset"))
++	held.release()
++	held.release()
++	require.Zero(t, lease.refs)
++	newLease := acquireAdaptiveTrial()
++	require.NotNil(t, newLease)
++	finishAdaptiveTrial(newLease)
++}
++
++func TestAdaptiveHighFanoutKeepsIndependentWindowProvenance(t *testing.T) {
++	lb, _, _, now := adaptivePolicyFixture(t, 10)
++	c, member := lb.adaptive, lb.adaptive.members[0]
++	for window := 0; window < 2; window++ {
++		at := now.Add(time.Duration(window) * 16 * time.Second)
++		for flow := 0; flow < 1024; flow++ {
++			c.addSampleLocked(member, adaptiveSample{flowID: uint64(window*1024 + flow + 1), cohort: 1, at: at, duration: time.Second, download: 100})
++		}
++		for cohort := 2; cohort < 100; cohort++ {
++			c.addSampleLocked(member, adaptiveSample{flowID: uint64(5000 + cohort), cohort: uint64(cohort), at: at, duration: time.Second, download: 100})
++		}
++	}
++	adaptiveRates(member, now.Add(17*time.Second))
++	require.True(t, member.proven)
++	require.Equal(t, 32, member.sampleCount)
++	require.InDelta(t, 100, member.mean, 0.001)
++	values := adaptiveComparisonValues(member, now.Add(-time.Second), now.Add(17*time.Second))
++	var matched int
++	for key, value := range values {
++		if key.cohort == 1 {
++			matched++
++			require.Len(t, value.flows, 2)
++			require.EqualValues(t, 102400, value.bytes)
++		}
++	}
++	require.Equal(t, 2, matched)
++}
++
++func TestAdaptiveUnsupportedCapabilitiesPreserveOriginalRouting(t *testing.T) {
++	for _, scenario := range []string{"mixed-udp", "l3"} {
++		t.Run(scenario, func(t *testing.T) {
++			lb, provider, proxies, now := adaptivePolicyFixture(t, 10, 20)
++			if scenario == "l3" {
++				proxies[0].l3 = true
++			} else {
++				proxies[0].noUDP = true
++			}
++			provider.replace([]C.Proxy{proxies[0], proxies[1]})
++			lb.adaptive.tick(now.Add(time.Second))
++			require.Equal(t, "unsupported", lb.adaptive.snapshot().State)
++			require.Empty(t, lb.adaptive.selected)
++			for _, proxy := range proxies {
++				proxy.dialErr = errors.New("original route attempted")
++			}
++			_, err := lb.DialContext(context.Background(), &C.Metadata{})
++			require.ErrorContains(t, err, "original route attempted")
++			require.Zero(t, lb.adaptive.total)
++			require.Equal(t, 1, proxies[0].dials+proxies[1].dials)
++		})
++	}
++	lb, provider, proxies, now := adaptivePolicyFixture(t, 10)
++	proxies[0].noUDP = true
++	provider.replace([]C.Proxy{proxies[0]})
++	lb.adaptive.tick(now.Add(time.Second))
++	_, err := lb.adaptive.admitNetwork(true)
++	require.ErrorIs(t, err, C.ErrNotSupport)
++	a, err := lb.adaptive.admit()
++	require.NoError(t, err)
++	a.release()
++	require.Equal(t, "active", lb.adaptive.snapshot().State)
++}
++
++func TestAdaptiveTrialPromotesAgainstCapturedBaselineWithConcurrentAnchor(t *testing.T) {
++	for _, scenario := range []string{"better", "weak", "no-anchor", "stale-reference"} {
++		t.Run(scenario, func(t *testing.T) {
++			lb, _, _, now := adaptivePolicyFixture(t, 10, 20, 30, 40)
++			c := lb.adaptive
++			started := *now
++			for i := 0; i < 3; i++ {
++				rate := uint64(300)
++				if i == 2 {
++					rate = 100
++				}
++				at := started.Add(-45 * time.Second)
++				if scenario == "stale-reference" {
++					at = started.Add(-4 * time.Minute)
++				}
++				for j := 0; j < 2; j++ {
++					c.addSampleLocked(c.members[i], adaptiveSample{flowID: uint64(i*10 + j + 1), cohort: 99, at: at.Add(time.Duration(j) * 16 * time.Second), duration: time.Second, download: rate})
++				}
++			}
++			c.recomputeLocked(started)
++			c.total = 20
++			c.startTrialLocked(started)
++			require.NotNil(t, c.trial)
++			candidate, displaced := c.trial.candidate, c.trial.displaced
++			require.Same(t, c.members[2], displaced)
++			require.NotContains(t, c.selected, displaced)
++			for j := 0; j < 2; j++ {
++				at := started.Add(time.Duration(j+1) * 16 * time.Second)
++				rate := uint64(150)
++				if scenario == "weak" {
++					rate = 105
++				}
++				c.addSampleLocked(candidate, adaptiveSample{flowID: uint64(100 + j), cohort: 99, at: at, duration: time.Second, download: rate})
++				if scenario != "no-anchor" {
++					c.addSampleLocked(c.members[0], adaptiveSample{flowID: uint64(200 + j), cohort: 99, at: at, duration: time.Second, download: 300})
++				}
++			}
++			*now = started.Add(33 * time.Second)
++			c.recomputeLocked(*now)
++			if scenario == "better" {
++				require.Nil(t, c.trial)
++				require.Contains(t, c.selected, candidate)
++				require.Equal(t, now.Add(10*time.Minute), candidate.protected)
++				require.True(t, displaced.nextChance.After(*now))
++				c.tick(now.Add(2 * time.Second))
++				require.Nil(t, c.trial, "successful promotion must not immediately retrial displaced node using stale overdue time")
++			} else {
++				require.NotNil(t, c.trial)
++				require.True(t, candidate.protected.IsZero())
++			}
++		})
++	}
++}
++
++func TestAdaptiveHealthFailureWithdrawalPreservesEscalatedCooldown(t *testing.T) {
++	for _, minutes := range []int{15, 45, 120} {
++		t.Run(fmt.Sprint(minutes), func(t *testing.T) {
++			lb, _, _, now := adaptivePolicyFixture(t, 10, 20, 30, 40)
++			c := lb.adaptive
++			for i := 0; i < 3; i++ {
++				adaptivePolicyEvidence(c, c.members[i], now.Add(-75*time.Second), 200, uint64(i*10+1))
++			}
++			c.recomputeLocked(*now)
++			c.total = 20
++			c.startTrialLocked(*now)
++			require.NotNil(t, c.trial)
++			candidate := c.trial.candidate
++			candidate.alive = false
++			candidate.cooldown = now.Add(time.Duration(minutes) * time.Minute)
++			c.pruneLocked(*now)
++			require.Nil(t, c.trial)
++			require.Equal(t, now.Add(time.Duration(minutes)*time.Minute), candidate.cooldown)
++		})
++	}
++}
++
++func TestAdaptiveNativeConfiguredHealthAndFailureExactlyOnce(t *testing.T) {
++	lb, _, proxies, _ := adaptivePolicyFixture(t, 10)
++	c := lb.adaptive
++	c.now = time.Now
++	c.checkHealth(c.members[0])
++	require.Equal(t, testUrl, proxies[0].testURL)
++	require.True(t, proxies[0].status.Check(204))
++	require.False(t, proxies[0].status.Check(200))
++	require.Nil(t, c.members[0].latency, "native zero-millisecond success is not fake 1ms")
++	proxies[0].dialErr = errors.New("dial refused")
++	_, err := lb.DialContext(context.Background(), &C.Metadata{})
++	require.Error(t, err)
++	require.Zero(t, c.members[0].failures)
++	admission := &adaptiveAdmission{controller: c, member: c.members[0]}
++	admission.fail(context.Canceled)
++	admission.fail(errors.New("first-write reset"))
++	admission.fail(errors.New("again"))
++	require.Zero(t, c.members[0].failures)
++	require.True(t, c.members[0].available(c.now()))
++	require.True(t, c.members[0].cooldown.IsZero())
++	_, err = lb.DialContext(context.Background(), &C.Metadata{Host: "other.example"})
++	require.Error(t, err)
++	require.Equal(t, 2, proxies[0].dials, "one destination refusal must not block another destination's admission")
++}
+diff --git a/adapter/outboundgroup/adaptive_conn.go b/adapter/outboundgroup/adaptive_conn.go
+new file mode 100644
+index 0000000..317f558
+--- /dev/null
++++ b/adapter/outboundgroup/adaptive_conn.go
+@@ -0,0 +1,250 @@
++package outboundgroup
++
++import (
++	"context"
++	"errors"
++	"hash/maphash"
++	"io"
++	"net"
++	"os"
++	"strings"
++	"sync"
++	"sync/atomic"
++	"time"
++
++	"github.com/metacubex/mihomo/common/buf"
++	N "github.com/metacubex/mihomo/common/net"
++	C "github.com/metacubex/mihomo/constant"
++)
++
++var (
++	adaptiveFlowID     atomic.Uint64
++	adaptiveTargetSeed = maphash.MakeSeed()
++)
++
++type adaptiveFlow struct {
++	id       uint64
++	cohort   uint64
++	download atomic.Uint64
++	upload   atomic.Uint64
++	mu       sync.Mutex
++	last     time.Time
++}
++
++func newAdaptiveFlow(metadata *C.Metadata) *adaptiveFlow {
++	var target maphash.Hash
++	target.SetSeed(adaptiveTargetSeed)
++	if metadata != nil {
++		if metadata.Host != "" {
++			target.WriteString(strings.ToLower(strings.TrimSuffix(metadata.Host, ".")))
++		} else if metadata.DstIP.IsValid() {
++			address := metadata.DstIP.Unmap().As16()
++			target.Write(address[:])
++		}
++		target.WriteByte(byte(metadata.NetWork))
++		target.WriteByte(byte(metadata.DstPort >> 8))
++		target.WriteByte(byte(metadata.DstPort))
++	}
++	return &adaptiveFlow{id: adaptiveFlowID.Add(1), cohort: target.Sum64(), last: time.Now()}
++}
++
++func (f *adaptiveFlow) drain(now time.Time) adaptiveSample {
++	f.mu.Lock()
++	defer f.mu.Unlock()
++	sample := adaptiveSample{
++		flowID: f.id, cohort: f.cohort, at: now,
++		download: f.download.Swap(0), upload: f.upload.Swap(0),
++	}
++	if sample.download != 0 || sample.upload != 0 {
++		sample.duration = now.Sub(f.last)
++		if sample.duration > time.Second {
++			sample.duration = time.Second
++		}
++		if sample.duration <= 0 {
++			sample.duration = time.Nanosecond
++		}
++	}
++	f.last = now
++	return sample
++}
++
++func (f *adaptiveFlow) countDownload(n int64) {
++	if n > 0 {
++		f.download.Add(uint64(n))
++	}
++}
++
++func (f *adaptiveFlow) countUpload(n int64) {
++	if n > 0 {
++		f.upload.Add(uint64(n))
++	}
++}
++
++func adaptiveTransportFailure(err error) bool {
++	if err == nil || errors.Is(err, io.EOF) || errors.Is(err, context.Canceled) ||
++		errors.Is(err, context.DeadlineExceeded) || errors.Is(err, os.ErrDeadlineExceeded) ||
++		errors.Is(err, net.ErrClosed) || errors.Is(err, os.ErrClosed) {
++		return false
++	}
++	var timeout net.Error
++	return !errors.As(err, &timeout) || !timeout.Timeout()
++}
++
++// The uncounted view keeps transport errors observable after copy unwraps counters.
++type adaptiveTransportConn struct {
++	C.Conn
++	admission *adaptiveAdmission
++	closing   atomic.Bool
++}
++
++func (c *adaptiveTransportConn) observe(err error) {
++	if !c.closing.Load() && adaptiveTransportFailure(err) {
++		c.admission.fail(err)
++	}
++}
++
++func (c *adaptiveTransportConn) Read(p []byte) (int, error) {
++	n, err := c.Conn.Read(p)
++	c.observe(err)
++	return n, err
++}
++
++func (c *adaptiveTransportConn) Write(p []byte) (int, error) {
++	n, err := c.Conn.Write(p)
++	c.observe(err)
++	return n, err
++}
++
++func (c *adaptiveTransportConn) ReadBuffer(buffer *buf.Buffer) error {
++	err := c.Conn.ReadBuffer(buffer)
++	c.observe(err)
++	return err
++}
++
++func (c *adaptiveTransportConn) WriteBuffer(buffer *buf.Buffer) error {
++	err := c.Conn.WriteBuffer(buffer)
++	c.observe(err)
++	return err
++}
++
++func (c *adaptiveTransportConn) Upstream() any           { return c.Conn }
++func (c *adaptiveTransportConn) ReaderReplaceable() bool { return false }
++func (c *adaptiveTransportConn) WriterReplaceable() bool { return false }
++
++type adaptiveConn struct {
++	*adaptiveTransportConn
++	flow      *adaptiveFlow
++	closeOnce sync.Once
++	closeErr  error
++}
++
++func newAdaptiveConn(conn C.Conn, admission *adaptiveAdmission, metadata *C.Metadata) C.Conn {
++	flow := newAdaptiveFlow(metadata)
++	admission.registerFlow(flow)
++	return &adaptiveConn{
++		adaptiveTransportConn: &adaptiveTransportConn{Conn: conn, admission: admission},
++		flow:                  flow,
++	}
++}
++
++func (c *adaptiveConn) Read(p []byte) (int, error) {
++	n, err := c.adaptiveTransportConn.Read(p)
++	c.flow.countDownload(int64(n))
++	return n, err
++}
++
++func (c *adaptiveConn) Write(p []byte) (int, error) {
++	n, err := c.adaptiveTransportConn.Write(p)
++	c.flow.countUpload(int64(n))
++	return n, err
++}
++
++func (c *adaptiveConn) ReadBuffer(buffer *buf.Buffer) error {
++	err := c.adaptiveTransportConn.ReadBuffer(buffer)
++	c.flow.countDownload(int64(buffer.Len()))
++	return err
++}
++
++func (c *adaptiveConn) WriteBuffer(buffer *buf.Buffer) error {
++	n := buffer.Len()
++	err := c.adaptiveTransportConn.WriteBuffer(buffer)
++	if err == nil {
++		c.flow.countUpload(int64(n))
++	}
++	return err
++}
++
++func (c *adaptiveConn) UnwrapReader() (io.Reader, []N.CountFunc) {
++	return c.adaptiveTransportConn, []N.CountFunc{c.flow.countDownload}
++}
++
++func (c *adaptiveConn) UnwrapWriter() (io.Writer, []N.CountFunc) {
++	return c.adaptiveTransportConn, []N.CountFunc{c.flow.countUpload}
++}
++
++func (c *adaptiveConn) Close() error {
++	c.closeOnce.Do(func() {
++		c.closing.Store(true)
++		c.closeErr = c.Conn.Close()
++		c.admission.finishFlow(c.flow)
++	})
++	return c.closeErr
++}
++
++type adaptivePacketConn struct {
++	C.PacketConn
++	admission *adaptiveAdmission
++	flow      *adaptiveFlow
++	closing   atomic.Bool
++	closeOnce sync.Once
++	closeErr  error
++}
++
++func newAdaptivePacketConn(conn C.PacketConn, admission *adaptiveAdmission, metadata *C.Metadata) C.PacketConn {
++	flow := newAdaptiveFlow(metadata)
++	admission.registerFlow(flow)
++	return &adaptivePacketConn{PacketConn: conn, admission: admission, flow: flow}
++}
++
++func (c *adaptivePacketConn) observe(err error) {
++	if !c.closing.Load() && adaptiveTransportFailure(err) {
++		c.admission.fail(err)
++	}
++}
++
++func (c *adaptivePacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
++	n, addr, err := c.PacketConn.ReadFrom(p)
++	c.flow.countDownload(int64(n))
++	c.observe(err)
++	return n, addr, err
++}
++
++func (c *adaptivePacketConn) WaitReadFrom() ([]byte, func(), net.Addr, error) {
++	data, put, addr, err := c.PacketConn.WaitReadFrom()
++	c.flow.countDownload(int64(len(data)))
++	c.observe(err)
++	return data, put, addr, err
++}
++
++func (c *adaptivePacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {
++	n, err := c.PacketConn.WriteTo(p, addr)
++	c.flow.countUpload(int64(n))
++	c.observe(err)
++	return n, err
++}
++
++func (c *adaptivePacketConn) Upstream() any           { return c.PacketConn }
++func (c *adaptivePacketConn) ReaderReplaceable() bool { return false }
++func (c *adaptivePacketConn) WriterReplaceable() bool { return false }
++
++func (c *adaptivePacketConn) Close() error {
++	c.closeOnce.Do(func() {
++		c.closing.Store(true)
++		c.closeErr = c.PacketConn.Close()
++		c.admission.finishFlow(c.flow)
++	})
++	return c.closeErr
++}
++
++var _ C.Conn = (*adaptiveConn)(nil)
++var _ C.PacketConn = (*adaptivePacketConn)(nil)
+diff --git a/adapter/outboundgroup/adaptive_conn_test.go b/adapter/outboundgroup/adaptive_conn_test.go
+new file mode 100644
+index 0000000..12429d8
+--- /dev/null
++++ b/adapter/outboundgroup/adaptive_conn_test.go
+@@ -0,0 +1,342 @@
++package outboundgroup
++
++import (
++	"bytes"
++	"context"
++	"errors"
++	"io"
++	"net"
++	"net/netip"
++	"os"
++	"sync"
++	"syscall"
++	"testing"
++	"time"
++
++	"github.com/metacubex/mihomo/common/buf"
++	N "github.com/metacubex/mihomo/common/net"
++	C "github.com/metacubex/mihomo/constant"
++	"github.com/metacubex/sing/common/bufio"
++	SN "github.com/metacubex/sing/common/network"
++
++	"github.com/stretchr/testify/require"
++)
++
++func adaptiveTransportTestAdmission(t *testing.T) *adaptiveAdmission {
++	t.Helper()
++	member := &adaptiveMember{valid: true, confirmed: true, alive: true, checked: time.Now()}
++	controller := &adaptiveController{now: time.Now, flows: make(map[*adaptiveFlow]*adaptiveAdmission), members: []*adaptiveMember{member}}
++	return &adaptiveAdmission{controller: controller, member: member}
++}
++
++type adaptiveTestConn struct {
++	C.Conn
++	reader     *bytes.Reader
++	written    bytes.Buffer
++	writeLimit int
++	readErr    error
++	writeErr   error
++	closeErr   error
++	closes     int
++	deadline   time.Time
++	chain      C.Chain
++	providers  C.Chain
++}
++
++func (c *adaptiveTestConn) Read(p []byte) (int, error) {
++	if c.readErr != nil {
++		return 0, c.readErr
++	}
++	return c.reader.Read(p)
++}
++func (c *adaptiveTestConn) Write(p []byte) (int, error) {
++	if c.writeLimit >= 0 && c.writeLimit < len(p) {
++		p = p[:c.writeLimit]
++	}
++	n, _ := c.written.Write(p)
++	return n, c.writeErr
++}
++func (c *adaptiveTestConn) ReadBuffer(buffer *buf.Buffer) error {
++	n, err := c.Read(buffer.FreeBytes())
++	buffer.Truncate(n)
++	return err
++}
++func (c *adaptiveTestConn) WriteBuffer(buffer *buf.Buffer) error {
++	defer buffer.Release()
++	_, err := c.Write(buffer.Bytes())
++	return err
++}
++func (c *adaptiveTestConn) Close() error                       { c.closes++; return c.closeErr }
++func (c *adaptiveTestConn) LocalAddr() net.Addr                { return &net.TCPAddr{Port: 1234} }
++func (c *adaptiveTestConn) RemoteAddr() net.Addr               { return &net.TCPAddr{Port: 443} }
++func (c *adaptiveTestConn) SetDeadline(t time.Time) error      { c.deadline = t; return nil }
++func (c *adaptiveTestConn) SetReadDeadline(t time.Time) error  { c.deadline = t; return nil }
++func (c *adaptiveTestConn) SetWriteDeadline(t time.Time) error { c.deadline = t; return nil }
++func (c *adaptiveTestConn) Chains() C.Chain                    { return c.chain }
++func (c *adaptiveTestConn) ProviderChains() C.Chain            { return c.providers }
++func (c *adaptiveTestConn) AppendToChains(a C.ProxyAdapter)    { c.chain = append(c.chain, a.Name()) }
++func (c *adaptiveTestConn) RemoteDestination() string          { return "egress.example" }
++
++func TestAdaptiveFlowDrainsOnlyActiveWindows(t *testing.T) {
++	flow := newAdaptiveFlow(&C.Metadata{Host: "Example.COM.", DstPort: 443})
++	other := newAdaptiveFlow(&C.Metadata{Host: "example.com", DstPort: 443})
++	require.NotEqual(t, flow.id, other.id)
++	require.Equal(t, flow.cohort, other.cohort)
++	flow.last = time.Now().Add(-time.Minute)
++	flow.countDownload(20)
++	flow.countUpload(10)
++	flow.countUpload(-1)
++	now := time.Now()
++	sample := flow.drain(now)
++	require.Equal(t, uint64(20), sample.download)
++	require.Equal(t, uint64(10), sample.upload)
++	require.Equal(t, time.Second, sample.duration)
++	idle := flow.drain(now.Add(time.Second))
++	require.Zero(t, idle.download)
++	require.Zero(t, idle.upload)
++	require.Zero(t, idle.duration)
++	ip := newAdaptiveFlow(&C.Metadata{DstIP: netip.MustParseAddr("192.0.2.1"), DstPort: 443})
++	mapped := newAdaptiveFlow(&C.Metadata{DstIP: netip.MustParseAddr("::ffff:192.0.2.1"), DstPort: 443})
++	require.Equal(t, ip.cohort, mapped.cohort)
++}
++
++func TestAdaptiveTransportFailureClassification(t *testing.T) {
++	for _, err := range []error{nil, io.EOF, context.Canceled, context.DeadlineExceeded, os.ErrDeadlineExceeded, net.ErrClosed, os.ErrClosed} {
++		require.False(t, adaptiveTransportFailure(err), "%v", err)
++		if err != nil {
++			require.False(t, adaptiveTransportFailure(errors.Join(errors.New("transport"), err)), "%v", err)
++		}
++	}
++	require.True(t, adaptiveTransportFailure(io.ErrUnexpectedEOF))
++	require.True(t, adaptiveTransportFailure(errors.New("handshake rejected")))
++}
++
++func TestAdaptiveConnByteAccountingAndMetadata(t *testing.T) {
++	admission := adaptiveTransportTestAdmission(t)
++	underlying := &adaptiveTestConn{reader: bytes.NewReader([]byte("download")), writeLimit: -1, chain: C.Chain{"node"}, providers: C.Chain{"provider"}}
++	conn := newAdaptiveConn(underlying, admission, &C.Metadata{Host: "example.com"}).(*adaptiveConn)
++	defer conn.Close()
++	payload := make([]byte, 3)
++	n, err := conn.Read(payload)
++	require.NoError(t, err)
++	require.Equal(t, 3, n)
++	buffer := buf.New()
++	require.NoError(t, conn.ReadBuffer(buffer))
++	require.Equal(t, "nload", string(buffer.Bytes()))
++	buffer.Release()
++	_, err = conn.Write([]byte("up"))
++	require.NoError(t, err)
++	require.NoError(t, conn.WriteBuffer(buf.As([]byte("load"))))
++	sample := conn.flow.drain(time.Now())
++	require.Equal(t, uint64(8), sample.download)
++	require.Equal(t, uint64(6), sample.upload)
++	require.Equal(t, underlying.chain, conn.Chains())
++	require.Equal(t, underlying.providers, conn.ProviderChains())
++	require.Equal(t, "egress.example", conn.RemoteDestination())
++	require.Equal(t, underlying.LocalAddr(), conn.LocalAddr())
++	require.Equal(t, underlying.RemoteAddr(), conn.RemoteAddr())
++	deadline := time.Now().Add(time.Minute)
++	require.NoError(t, conn.SetDeadline(deadline))
++	require.Equal(t, deadline, underlying.deadline)
++	require.Same(t, underlying, conn.Upstream())
++	require.Same(t, conn, N.UnwrapReader(conn))
++	require.Same(t, conn, N.UnwrapWriter(conn))
++}
++
++func TestAdaptiveConnCopyCountersDoNotDoubleCount(t *testing.T) {
++	admission := adaptiveTransportTestAdmission(t)
++	underlying := &adaptiveTestConn{reader: bytes.NewReader([]byte("copy download")), writeLimit: -1}
++	conn := newAdaptiveConn(underlying, admission, nil).(*adaptiveConn)
++	defer conn.Close()
++	reader, counters := SN.UnwrapCountReader(conn, nil)
++	require.NotSame(t, conn, reader)
++	require.Len(t, counters, 1)
++	var destination bytes.Buffer
++	n, err := bufio.Copy(&destination, conn)
++	require.NoError(t, err)
++	require.Equal(t, int64(len("copy download")), n)
++	n, err = bufio.Copy(conn, bytes.NewReader([]byte("copy upload")))
++	require.NoError(t, err)
++	require.Equal(t, int64(len("copy upload")), n)
++	sample := conn.flow.drain(time.Now())
++	require.Equal(t, uint64(len("copy download")), sample.download)
++	require.Equal(t, uint64(len("copy upload")), sample.upload)
++	require.Equal(t, "copy download", destination.String())
++	require.Equal(t, "copy upload", underlying.written.String())
++}
++
++func TestAdaptiveConnPartialWriteAndCloseOnce(t *testing.T) {
++	admission := adaptiveTransportTestAdmission(t)
++	closeErr := errors.New("close result")
++	underlying := &adaptiveTestConn{reader: bytes.NewReader(nil), writeLimit: 2, writeErr: io.ErrShortWrite, closeErr: closeErr}
++	conn := newAdaptiveConn(underlying, admission, nil).(*adaptiveConn)
++	n, err := conn.Write([]byte("partial"))
++	require.Equal(t, 2, n)
++	require.ErrorIs(t, err, io.ErrShortWrite)
++	require.Equal(t, uint64(2), conn.flow.upload.Load())
++	conn.flow.last = time.Now().Add(-time.Second)
++	var wg sync.WaitGroup
++	for i := 0; i < 16; i++ {
++		wg.Add(1)
++		go func() { defer wg.Done(); require.ErrorIs(t, conn.Close(), closeErr) }()
++	}
++	wg.Wait()
++	require.Equal(t, 1, underlying.closes)
++	require.Empty(t, admission.controller.flows)
++	require.Zero(t, admission.member.failures)
++	require.True(t, admission.member.alive)
++	require.True(t, admission.member.cooldown.IsZero())
++	require.Equal(t, 1, admission.member.sampleCount)
++	var upload uint64
++	for _, sample := range admission.member.samples {
++		upload += sample.upload
++	}
++	require.Equal(t, uint64(2), upload)
++}
++
++func TestAdaptiveConnUnwrappedHandshakeFailures(t *testing.T) {
++	for _, direction := range []string{"read", "write", "buffer-write"} {
++		t.Run(direction, func(t *testing.T) {
++			admission := adaptiveTransportTestAdmission(t)
++			underlying := &adaptiveTestConn{reader: bytes.NewReader(nil), writeLimit: -1}
++			conn := newAdaptiveConn(underlying, admission, nil).(*adaptiveConn)
++			defer conn.Close()
++			failure := errors.New("handshake rejected")
++			if direction == "read" {
++				underlying.readErr = failure
++				reader, _ := SN.UnwrapCountReader(conn, nil)
++				_, err := reader.Read(make([]byte, 8))
++				require.ErrorIs(t, err, failure)
++			} else {
++				underlying.writeErr = failure
++				underlying.writeLimit = 0
++				writer, _ := SN.UnwrapCountWriter(conn, nil)
++				if direction == "buffer-write" {
++					require.ErrorIs(t, writer.(N.ExtendedWriter).WriteBuffer(buf.As([]byte("hello"))), failure)
++				} else {
++					_, err := writer.Write([]byte("hello"))
++					require.ErrorIs(t, err, failure)
++				}
++			}
++			unobserved := false
++			admission.failed.Do(func() { unobserved = true })
++			require.False(t, unobserved, "unwrapped transport error did not reach admission")
++			require.Zero(t, admission.member.failures)
++			require.True(t, admission.member.alive)
++			require.True(t, admission.member.cooldown.IsZero())
++			require.True(t, admission.member.available(time.Now()))
++		})
++	}
++	for _, normal := range []error{io.EOF, context.Canceled, os.ErrDeadlineExceeded, net.ErrClosed} {
++		admission := adaptiveTransportTestAdmission(t)
++		underlying := &adaptiveTestConn{reader: bytes.NewReader(nil), readErr: normal, writeLimit: -1}
++		conn := newAdaptiveConn(underlying, admission, nil)
++		_, err := conn.Read(make([]byte, 8))
++		require.ErrorIs(t, err, normal)
++		require.NoError(t, conn.Close())
++		require.Zero(t, admission.member.failures)
++	}
++}
++
++func TestAdaptiveConnDestinationRefusalDoesNotInvalidateProxy(t *testing.T) {
++	admission := adaptiveTransportTestAdmission(t)
++	failure := &net.OpError{Op: "read", Net: "tcp", Err: syscall.ECONNREFUSED}
++	underlying := &adaptiveTestConn{reader: bytes.NewReader(nil), readErr: failure, writeLimit: -1}
++	conn := newAdaptiveConn(underlying, admission, nil)
++	_, err := conn.Read(make([]byte, 8))
++	require.ErrorIs(t, err, syscall.ECONNREFUSED)
++	require.True(t, admission.member.available(time.Now()))
++	require.Zero(t, admission.member.failures)
++	require.True(t, admission.member.cooldown.IsZero())
++	require.NoError(t, conn.Close())
++}
++
++func TestAdaptiveConnRemainsUsableAfterRetirement(t *testing.T) {
++	admission := adaptiveTransportTestAdmission(t)
++	ctx, cancel := context.WithCancel(context.Background())
++	admission.controller.ctx, admission.controller.cancel = ctx, cancel
++	underlying := &adaptiveTestConn{reader: bytes.NewReader([]byte("still active")), writeLimit: -1}
++	conn := newAdaptiveConn(underlying, admission, nil)
++	admission.controller.retire()
++	require.ErrorIs(t, ctx.Err(), context.Canceled)
++	require.Zero(t, underlying.closes)
++	n, err := conn.Write([]byte("ongoing"))
++	require.NoError(t, err)
++	require.Equal(t, len("ongoing"), n)
++	require.NoError(t, conn.Close())
++	require.NoError(t, conn.Close())
++	require.Equal(t, 1, underlying.closes)
++}
++
++type adaptiveTestPacketConn struct {
++	C.PacketConn
++	data       []byte
++	put        func()
++	addr       net.Addr
++	closes     int
++	writeLimit int
++	writeErr   error
++	resolved   *C.Metadata
++	readErr    error
++}
++
++func (c *adaptiveTestPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
++	return copy(p, c.data), c.addr, c.readErr
++}
++func (c *adaptiveTestPacketConn) WaitReadFrom() ([]byte, func(), net.Addr, error) {
++	return c.data, c.put, c.addr, c.readErr
++}
++func (c *adaptiveTestPacketConn) WriteTo(p []byte, _ net.Addr) (int, error) {
++	if c.writeLimit >= 0 && c.writeLimit < len(p) {
++		return c.writeLimit, c.writeErr
++	}
++	return len(p), c.writeErr
++}
++func (c *adaptiveTestPacketConn) ResolveUDP(_ context.Context, metadata *C.Metadata) error {
++	c.resolved = metadata
++	return nil
++}
++func (c *adaptiveTestPacketConn) Close() error { c.closes++; return nil }
++
++func TestAdaptivePacketConnWaitReadOwnershipAndBytes(t *testing.T) {
++	admission := adaptiveTransportTestAdmission(t)
++	puts := 0
++	underlying := &adaptiveTestPacketConn{data: []byte("packet"), put: func() { puts++ }, addr: &net.UDPAddr{Port: 53}, writeLimit: 2}
++	conn := newAdaptivePacketConn(underlying, admission, nil).(*adaptivePacketConn)
++	data, put, addr, err := conn.WaitReadFrom()
++	require.NoError(t, err)
++	require.Equal(t, underlying.addr, addr)
++	require.Equal(t, "packet", string(data))
++	require.Equal(t, 0, puts)
++	data[0] = 'P'
++	require.Equal(t, byte('P'), underlying.data[0])
++	put()
++	require.Equal(t, 1, puts)
++	payload := make([]byte, 3)
++	n, _, err := conn.ReadFrom(payload)
++	require.NoError(t, err)
++	require.Equal(t, 3, n)
++	n, err = conn.WriteTo([]byte("upload"), addr)
++	require.NoError(t, err)
++	require.Equal(t, 2, n)
++	sample := conn.flow.drain(time.Now())
++	require.Equal(t, uint64(9), sample.download)
++	require.Equal(t, uint64(2), sample.upload)
++	metadata := &C.Metadata{Host: "resolve.example"}
++	require.NoError(t, conn.ResolveUDP(context.Background(), metadata))
++	require.Same(t, metadata, underlying.resolved)
++	underlying.readErr = errors.New("UDP transport failed")
++	_, _, _, err = conn.WaitReadFrom()
++	require.ErrorIs(t, err, underlying.readErr)
++	underlying.writeErr = underlying.readErr
++	_, err = conn.WriteTo([]byte("fail"), addr)
++	require.ErrorIs(t, err, underlying.readErr)
++	require.Zero(t, admission.member.failures)
++	require.True(t, admission.member.alive)
++	require.True(t, admission.member.cooldown.IsZero())
++	require.False(t, conn.ReaderReplaceable())
++	require.False(t, conn.WriterReplaceable())
++	require.NoError(t, conn.Close())
++	require.NoError(t, conn.Close())
++	require.Equal(t, 1, underlying.closes)
++}
+diff --git a/tunnel/tunnel.go b/tunnel/tunnel.go
+index 86dbc14..084850d 100644
+--- a/tunnel/tunnel.go
++++ b/tunnel/tunnel.go
+@@ -229,9 +229,36 @@ func RuleProviders() map[string]P.RuleProvider {
+ // UpdateProxies handle update proxies
+ func UpdateProxies(newProxies map[string]C.Proxy, newProviders map[string]P.ProxyProvider) {
+ 	configMux.Lock()
++	oldProxies := proxies
+ 	proxies = newProxies
+ 	providers = newProviders
+ 	configMux.Unlock()
++
++	type adaptiveLifecycle interface {
++		ActivateAdaptive()
++		RetireAdaptive()
++	}
++	newAdaptive := make(map[adaptiveLifecycle]struct{})
++	for _, proxy := range newProxies {
++		if adaptive, ok := proxy.Adapter().(adaptiveLifecycle); ok {
++			newAdaptive[adaptive] = struct{}{}
++		}
++	}
++	retired := make(map[adaptiveLifecycle]struct{})
++	for _, proxy := range oldProxies {
++		if adaptive, ok := proxy.Adapter().(adaptiveLifecycle); ok {
++			if _, retained := newAdaptive[adaptive]; retained {
++				continue
++			}
++			if _, done := retired[adaptive]; !done {
++				adaptive.RetireAdaptive()
++				retired[adaptive] = struct{}{}
++			}
++		}
++	}
++	for adaptive := range newAdaptive {
++		adaptive.ActivateAdaptive()
++	}
+ }
+ 
+ func UpdateListeners(newListeners map[string]C.InboundListener) {
+diff --git a/tunnel/adaptive_lifecycle_test.go b/tunnel/adaptive_lifecycle_test.go
+new file mode 100644
+index 0000000..8e4b8e3
+--- /dev/null
++++ b/tunnel/adaptive_lifecycle_test.go
+@@ -0,0 +1,85 @@
++package tunnel
++
++import (
++	"reflect"
++	"testing"
++
++	C "github.com/metacubex/mihomo/constant"
++)
++
++type adaptiveLifecycleProxy struct {
++	C.Proxy
++	adapter C.ProxyAdapter
++}
++
++func (p *adaptiveLifecycleProxy) Adapter() C.ProxyAdapter { return p.adapter }
++
++type adaptiveLifecycleAdapter struct {
++	C.ProxyAdapter
++	events *[]string
++	name   string
++	closes int
++}
++
++func (a *adaptiveLifecycleAdapter) ActivateAdaptive() {
++	configMux.RLock()
++	configMux.RUnlock()
++	*a.events = append(*a.events, "activate:"+a.name)
++}
++
++func (a *adaptiveLifecycleAdapter) RetireAdaptive() {
++	configMux.RLock()
++	configMux.RUnlock()
++	*a.events = append(*a.events, "retire:"+a.name)
++}
++
++func (a *adaptiveLifecycleAdapter) Close() error {
++	a.closes++
++	return nil
++}
++
++func TestUpdateProxiesAdaptiveLifecycle(t *testing.T) {
++	configMux.Lock()
++	previousProxies, previousProviders := proxies, providers
++	proxies = nil
++	providers = nil
++	configMux.Unlock()
++	t.Cleanup(func() {
++		UpdateProxies(nil, nil)
++		configMux.Lock()
++		proxies, providers = previousProxies, previousProviders
++		configMux.Unlock()
++	})
++
++	var events []string
++	old := &adaptiveLifecycleAdapter{events: &events, name: "old"}
++	retained := &adaptiveLifecycleAdapter{events: &events, name: "retained"}
++	fresh := &adaptiveLifecycleAdapter{events: &events, name: "fresh"}
++	if len(events) != 0 {
++		t.Fatal("construction activated adaptive state")
++	}
++	oldProxy := &adaptiveLifecycleProxy{adapter: old}
++	retainedProxy := &adaptiveLifecycleProxy{adapter: retained}
++	UpdateProxies(map[string]C.Proxy{"old": oldProxy, "alias": oldProxy, "retained": retainedProxy}, nil)
++	events = nil
++	UpdateProxies(map[string]C.Proxy{
++		"renamed-retained": retainedProxy,
++		"fresh":            &adaptiveLifecycleProxy{adapter: fresh},
++		"ordinary":         &adaptiveLifecycleProxy{adapter: struct{ C.ProxyAdapter }{}},
++	}, nil)
++	if len(events) != 3 || events[0] != "retire:old" {
++		t.Fatalf("expected old retirement before new activation, got %v", events)
++	}
++	activated := map[string]bool{events[1]: true, events[2]: true}
++	if !reflect.DeepEqual(activated, map[string]bool{"activate:retained": true, "activate:fresh": true}) {
++		t.Fatalf("unexpected activation events %v", events)
++	}
++	if old.closes != 0 || retained.closes != 0 || fresh.closes != 0 {
++		t.Fatal("reload closed an adapter instead of retiring adaptive work")
++	}
++	events = nil
++	UpdateProxies(nil, nil)
++	if len(events) != 2 {
++		t.Fatalf("removal did not retire each adaptive adapter once: %v", events)
++	}
++}

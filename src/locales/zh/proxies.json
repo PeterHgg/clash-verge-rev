@@ -1,5 +1,45 @@
 {
   "page": {
+    "enhancement": {
+      "states": {
+        "warming": "还在观察",
+        "active": "帮你挑着用",
+        "probing": "延迟检测中",
+        "trial": "少量试用中",
+        "cooldown": "歇会儿再试",
+        "draining": "等之前的连接用完",
+        "unavailable": "暂时没有能用的节点",
+        "quarantined": "暂时停用",
+        "unsupported": "这个组暂不支持"
+      },
+      "descriptions": {
+        "warming": "先看看各节点的表现",
+        "active": "优先使用目前合适的节点",
+        "probing": "正在复用或更新 Clash 自带的延迟测试，不额外下载测速文件",
+        "trial": "正在少量试用一个备用节点",
+        "cooldown": "过一会儿再试，不影响其他可用节点",
+        "draining": "之前的连接还在用，等它们自然结束",
+        "unavailable": "暂时没找到能连接的节点",
+        "quarantined": "正在确认连接状态，暂时不再分配新连接",
+        "unsupported": "暂时沿用原来的连接方式"
+      },
+      "candidates": {
+        "probing": "检查中",
+        "trial": "少量试用中",
+        "selected": "正在使用",
+        "cooldown": "歇会儿再试",
+        "standby": "备用",
+        "untested": "还在观察",
+        "unavailable": "暂时连不上"
+      },
+      "insufficientEvidence": "还在观察",
+      "keepObserving": "再用一会儿看看",
+      "technicalDetails": "详细原因（供排查）",
+      "score": "{{score}} 分",
+      "retryRemaining": "{{seconds}} 秒后再试",
+      "checkRecency": "{{seconds}} 秒前检查",
+      "notChecked": "还未检查"
+    },
     "modes": {
       "rule": "规则",
       "global": "全局",

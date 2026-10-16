@@ -1,5 +1,45 @@
 {
   "page": {
+    "enhancement": {
+      "states": {
+        "warming": "Biraz daha gözlemliyoruz",
+        "active": "Sizin için düğüm seçiyoruz",
+        "probing": "Gecikme kontrol ediliyor",
+        "trial": "Sınırlı deneme",
+        "cooldown": "Daha sonra tekrar deneyeceğiz",
+        "draining": "Önceki bağlantıların bitmesini bekliyoruz",
+        "unavailable": "Şu an kullanılabilir düğüm yok",
+        "quarantined": "Şimdilik duraklatıldı",
+        "unsupported": "Bu grup henüz desteklenmiyor"
+      },
+      "descriptions": {
+        "warming": "Önce her düğümün nasıl çalıştığına bakıyoruz",
+        "active": "Şu anda iyi çalışan düğümlere öncelik veriyoruz",
+        "probing": "Ek hız testi dosyaları indirilmeden Clash’in yerleşik gecikme testleri yeniden kullanılıyor veya güncelleniyor",
+        "trial": "Yedek bir düğümü birkaç yeni bağlantıyla deniyoruz",
+        "cooldown": "Daha sonra tekrar deneyeceğiz; diğer kullanılabilir düğümler etkilenmez",
+        "draining": "Önceki bağlantılar hâlâ kullanılıyor; kendiliğinden bitmelerini bekliyoruz",
+        "unavailable": "Bağlanabilen bir düğüm henüz bulamadık",
+        "quarantined": "Bağlantı durumunu kontrol ediyoruz; şimdilik yeni bağlantı atamıyoruz",
+        "unsupported": "Şimdilik önceki bağlantı yöntemini koruyoruz"
+      },
+      "candidates": {
+        "probing": "Kontrol ediliyor",
+        "trial": "Sınırlı deneme",
+        "selected": "Kullanımda",
+        "cooldown": "Daha sonra tekrar deneyeceğiz",
+        "standby": "Yedek",
+        "untested": "Biraz daha gözlemliyoruz",
+        "unavailable": "Şu an bağlanamıyor"
+      },
+      "insufficientEvidence": "Biraz daha gözlemliyoruz",
+      "keepObserving": "Biraz daha kullanıp bakalım",
+      "technicalDetails": "Ayrıntılı neden (sorun giderme için)",
+      "score": "Puan {{score}}",
+      "retryRemaining": "{{seconds}} sn sonra tekrar deneyeceğiz",
+      "checkRecency": "{{seconds}} sn önce kontrol edildi",
+      "notChecked": "Henüz kontrol edilmedi"
+    },
     "modes": {
       "rule": "Kural",
       "global": "Küresel",

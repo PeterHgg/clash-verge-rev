@@ -16,11 +16,13 @@
         "systemProxy": "Sistem Vekil'i"
       },
       "tooltips": {
-        "silentStart": "Programı paneli görüntülemeden arka plan modunda başlatır"
+        "silentStart": "Programı paneli görüntülemeden arka plan modunda başlatır",
+        "loadBalanceEnhanced": "Başlangıçta kullanılabilirliği doğrulanmış, en düşük gecikmeli en fazla 3 düğümü seçer; ardından gerçek aktarım performansına daha fazla ağırlık verir. Çekirdek, pencere gizliyken de düğümleri bağımsız olarak seçer ve dönüşümlü kullanır; istemci yalnızca sonuçları gösterir. Yalnızca yapılandırılan URL’deki yerleşik Clash testlerini kullanır, ek hız testi dosyaları indirmez. Birlikte sunulan özel Mihomo v1.19.32-verge-adaptive1 ve açıkça round-robin olarak yapılandırılmış bir grup gerektirir. Her iki uyarlamalı çekirdek seçeneği de aynı özel çekirdeği kullanır. Desteklenmeyen gruplar önceki yöntemi korur; kapatmak kaynak yapılandırmayı geri getirir. Açıp kapatmak bağlantıları kısa süreli etkileyebilir."
       },
       "fields": {
         "autoLaunch": "Otomatik Başlat",
-        "silentStart": "Sessiz Başlatma"
+        "silentStart": "Sessiz Başlatma",
+        "loadBalanceEnhanced": "Gelişmiş Yük Dengeleme"
       },
       "notifications": {
         "tunMode": {
@@ -303,9 +305,10 @@
     },
     "clashCore": {
       "variants": {
-        "release": "Kararlı Sürüm",
-        "alpha": "Alfa Sürümü"
-      }
+        "release": "Uyarlamalı",
+        "alpha": "Uyarlamalı (uyumluluk seçeneği)"
+      },
+      "upgradeUnavailable": "Bu sürüm özel bir çekirdek kullanır. Yükseltmek için özel çekirdek içeren daha yeni bir uygulama sürümü yükleyin."
     },
     "liteMode": {
       "title": "Hafif Mod Ayarları",

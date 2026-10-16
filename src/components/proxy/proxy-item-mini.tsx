@@ -11,6 +11,8 @@ import {
   type ResolvedProxyMember,
 } from '@/types/proxy-view'
 
+import { ProxyEnhancementBadge } from './proxy-item'
+
 interface Props {
   group: ProxyGroupView
   member: ResolvedProxyMember
@@ -97,7 +99,7 @@ export const ProxyItemMini = (props: Props) => {
           {name}
         </Typography>
 
-        {showType && (
+        {(showType || group.enhancement) && (
           <Box
             sx={{
               display: 'flex',
@@ -106,7 +108,8 @@ export const ProxyItemMini = (props: Props) => {
               marginTop: '4px',
             }}
           >
-            {now && (
+            <ProxyEnhancementBadge group={group} name={name} />
+            {showType && now && (
               <Typography
                 variant="body2"
                 component="div"
@@ -123,30 +126,32 @@ export const ProxyItemMini = (props: Props) => {
                 {now}
               </Typography>
             )}
-            <TypeBox color="text.secondary" component="span">
-              {type}
-            </TypeBox>
-            {!unresolved && details?.udp && (
+            {showType && (
+              <TypeBox color="text.secondary" component="span">
+                {type}
+              </TypeBox>
+            )}
+            {showType && !unresolved && details?.udp && (
               <TypeBox color="text.secondary" component="span">
                 UDP
               </TypeBox>
             )}
-            {!unresolved && details?.xudp && (
+            {showType && !unresolved && details?.xudp && (
               <TypeBox color="text.secondary" component="span">
                 XUDP
               </TypeBox>
             )}
-            {!unresolved && details?.tfo && (
+            {showType && !unresolved && details?.tfo && (
               <TypeBox color="text.secondary" component="span">
                 TFO
               </TypeBox>
             )}
-            {!unresolved && details?.mptcp && (
+            {showType && !unresolved && details?.mptcp && (
               <TypeBox color="text.secondary" component="span">
                 MPTCP
               </TypeBox>
             )}
-            {!unresolved && details?.smux && (
+            {showType && !unresolved && details?.smux && (
               <TypeBox color="text.secondary" component="span">
                 SMUX
               </TypeBox>

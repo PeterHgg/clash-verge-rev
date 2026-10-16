@@ -69,6 +69,38 @@ export const ProxyRender = memo(function ProxyRender(props: RenderProps) {
     enabled: enable_group_icon,
   })
 
+  const enhancementLabels: Record<string, string> = {
+    warming: t('proxies.page.enhancement.states.warming'),
+    active: t('proxies.page.enhancement.states.active'),
+    probing: t('proxies.page.enhancement.states.probing'),
+    trial: t('proxies.page.enhancement.states.trial'),
+    cooldown: t('proxies.page.enhancement.states.cooldown'),
+    draining: t('proxies.page.enhancement.states.draining'),
+    unavailable: t('proxies.page.enhancement.states.unavailable'),
+    quarantined: t('proxies.page.enhancement.states.quarantined'),
+    unsupported: t('proxies.page.enhancement.states.unsupported'),
+  }
+  const enhancementLabel = group.enhancement
+    ? (enhancementLabels[group.enhancement.state] ?? enhancementLabels.warming)
+    : undefined
+  const enhancementDescriptions: Record<string, string> = {
+    warming: t('proxies.page.enhancement.descriptions.warming'),
+    active: t('proxies.page.enhancement.descriptions.active'),
+    probing: t('proxies.page.enhancement.descriptions.probing'),
+    trial: t('proxies.page.enhancement.descriptions.trial'),
+    cooldown: t('proxies.page.enhancement.descriptions.cooldown'),
+    draining: t('proxies.page.enhancement.descriptions.draining'),
+    unavailable: t('proxies.page.enhancement.descriptions.unavailable'),
+    quarantined: t('proxies.page.enhancement.descriptions.quarantined'),
+    unsupported: t('proxies.page.enhancement.descriptions.unsupported'),
+  }
+  const enhancementDescription = group.enhancement
+    ? (enhancementDescriptions[group.enhancement.state] ??
+      enhancementDescriptions.warming)
+    : undefined
+  const enhancementDetail = group.enhancement?.reason
+    ? `${t('proxies.page.enhancement.technicalDetails')}: ${group.enhancement.reason}`
+    : undefined
   const showType = headState?.showType
   const memberColItemsMemo = useMemo(() => {
     if (type !== 4 || !memberCol) {
@@ -140,9 +172,28 @@ export const ProxyRender = memo(function ProxyRender(props: RenderProps) {
                 }}
               >
                 <StyledTypeBox>{group.type}</StyledTypeBox>
-                <StyledSubtitle sx={{ color: 'text.secondary' }}>
-                  {group.now}
-                </StyledSubtitle>
+                <Tooltip
+                  title={
+                    group.enhancement ? (
+                      <Box>
+                        <Box>{enhancementDescription}</Box>
+                        {enhancementDetail && (
+                          <Box sx={{ mt: 0.5 }}>{enhancementDetail}</Box>
+                        )}
+                      </Box>
+                    ) : (
+                      (group.now ?? '')
+                    )
+                  }
+                  describeChild
+                >
+                  <StyledSubtitle
+                    tabIndex={group.enhancement ? 0 : undefined}
+                    sx={{ color: 'text.secondary' }}
+                  >
+                    {enhancementLabel || group.now}
+                  </StyledSubtitle>
+                </Tooltip>
               </Box>
             </Box>
           }

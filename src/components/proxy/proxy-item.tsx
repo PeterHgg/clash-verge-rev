@@ -7,6 +7,7 @@ import {
   ListItemIcon,
   ListItemText,
   styled,
+  Tooltip,
   type SxProps,
   type Theme,
 } from '@mui/material'
@@ -20,6 +21,8 @@ import {
   type ProxyGroupView,
   type ResolvedProxyMember,
 } from '@/types/proxy-view'
+
+import { candidateActivity } from './enhancement-status'
 
 interface Props {
   group: ProxyGroupView
@@ -47,6 +50,74 @@ const TypeBox = styled('span')(({ theme }) => ({
   padding: '0 2px',
   lineHeight: 1.25,
 }))
+
+export const ProxyEnhancementBadge = ({
+  group,
+  name,
+}: {
+  group: ProxyGroupView
+  name: string
+}) => {
+  const { t } = useTranslation()
+  if (!group.enhancement || group.enhancement.state === 'unsupported') {
+    return null
+  }
+  const candidate = group.enhancement.candidates.find(
+    (candidate) => candidate.name === name,
+  )
+  const state = candidate?.state ?? 'untested'
+  const labels: Record<string, string> = {
+    probing: t('proxies.page.enhancement.candidates.probing'),
+    trial: t('proxies.page.enhancement.candidates.trial'),
+    selected: t('proxies.page.enhancement.candidates.selected'),
+    cooldown: t('proxies.page.enhancement.candidates.cooldown'),
+    standby: t('proxies.page.enhancement.candidates.standby'),
+    untested: t('proxies.page.enhancement.candidates.untested'),
+    unavailable: t('proxies.page.enhancement.candidates.unavailable'),
+  }
+  const label = labels[state] ?? labels.untested
+  const cooldown = candidate?.cooldownRemainingSeconds
+  const cooldownLabel =
+    state === 'cooldown' && cooldown != null
+      ? t('proxies.page.enhancement.retryRemaining', { seconds: cooldown })
+      : ''
+  const activity = candidateActivity(candidate)
+  const activityText =
+    activity === 'score'
+      ? t('proxies.page.enhancement.score', {
+          score: candidate!.score!.toFixed(0),
+        })
+      : activity === 'keepObserving'
+        ? t('proxies.page.enhancement.keepObserving')
+        : activity === 'observing'
+          ? t('proxies.page.enhancement.insufficientEvidence')
+          : ''
+  const statusText = [label, cooldownLabel].filter(Boolean).join(' · ')
+  const lastChecked = candidate?.lastCheckedSecondsAgo
+  const checkRecency =
+    lastChecked != null
+      ? t('proxies.page.enhancement.checkRecency', { seconds: lastChecked })
+      : t('proxies.page.enhancement.notChecked')
+  const detailText = [statusText, activityText, checkRecency]
+    .filter(Boolean)
+    .join(' · ')
+  return (
+    <Tooltip title={detailText}>
+      <Box
+        component="span"
+        sx={{
+          display: 'inline-block',
+          color: state === 'selected' ? 'primary.main' : 'text.secondary',
+          fontSize: 10,
+          whiteSpace: 'nowrap',
+          mr: 0.5,
+        }}
+      >
+        {statusText}
+      </Box>
+    </Tooltip>
+  )
+}
 
 export const ProxyItem = (props: Props) => {
   const { t } = useTranslation()
@@ -112,6 +183,7 @@ export const ProxyItem = (props: Props) => {
                 {name}
                 {showType && now && ` - ${now}`}
               </Box>
+              <ProxyEnhancementBadge group={group} name={name} />
               {showType && <TypeBox>{type}</TypeBox>}
               {!unresolved && showType && details?.udp && (
                 <TypeBox>UDP</TypeBox>

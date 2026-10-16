@@ -73,6 +73,7 @@ verge_registry! {
     enable_auto_launch => [Autostart];
     enable_silent_start => NoEffect;
     enable_system_proxy => [SystemProxy, TrayMenu, TrayTooltip, TrayIcon];
+    enable_load_balance_enhanced => [ClashConfig];
     enable_proxy_guard => [SystemProxy];
     enable_bypass_check => NoEffect;
     enable_dns_settings => NoEffect;
@@ -173,7 +174,7 @@ mod tests {
     fn representative_verge_patches_map_to_frozen_effects() {
         assert_eq!(verge_effects(&IVerge::default()), Effects::new());
 
-        let cases: [(IVerge, &[Effect]); 9] = [
+        let cases: [(IVerge, &[Effect]); 11] = [
             (
                 verge_patch(|p| p.verge_mixed_port = Some(27899)),
                 &[Effect::RestartCore],
@@ -194,6 +195,14 @@ mod tests {
                     Effect::TrayMenu,
                     Effect::TrayTooltip,
                 ],
+            ),
+            (
+                verge_patch(|p| p.enable_load_balance_enhanced = Some(true)),
+                &[Effect::ClashConfig],
+            ),
+            (
+                verge_patch(|p| p.enable_load_balance_enhanced = Some(false)),
+                &[Effect::ClashConfig],
             ),
             (
                 verge_patch(|p| p.system_proxy_bypass = Some("localhost".into())),

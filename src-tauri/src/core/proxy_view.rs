@@ -1,5 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
+use crate::{core::load_balance::GroupStatus, enhance::load_balance::EnhancementPlan};
+
 use serde::{Serialize, Serializer, ser::SerializeMap as _};
 use tauri_plugin_mihomo::models::{
     DelayHistory, Extra, Proxies, Proxy, ProxyProvider, ProxyProviders, ProxyType, VehicleType,
@@ -20,7 +22,7 @@ pub struct GroupScope {
 
 pub struct ProxyViewBuilder;
 
-#[derive(Debug, PartialEq, Eq, Serialize, specta::Type)]
+#[derive(Debug, PartialEq, Serialize, specta::Type)]
 #[serde(rename_all = "camelCase")]
 pub struct ProxyViewV1 {
     pub schema_version: u8,
@@ -79,7 +81,7 @@ fn serialize_proxy_latency_history<S: Serializer>(
     map.end()
 }
 
-#[derive(Debug, PartialEq, Eq, Serialize, specta::Type)]
+#[derive(Debug, PartialEq, Serialize, specta::Type)]
 #[serde(rename_all = "camelCase")]
 pub struct ProxyGroupView {
     pub name: String,
@@ -104,6 +106,8 @@ pub struct ProxyGroupView {
     #[serde(flatten)]
     pub capabilities: ProxyCapabilities,
     pub members: Vec<ProxyMemberRef>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enhancement: Option<GroupStatus>,
 }
 
 #[derive(Debug, PartialEq, Eq, Serialize, specta::Type)]
@@ -272,6 +276,54 @@ impl<'a> MemberResolver<'a> {
 }
 
 impl ProxyViewBuilder {
+    pub fn build_enhanced(
+        input: ProxyViewInput,
+        plan: Option<&EnhancementPlan>,
+        mut status: BTreeMap<String, GroupStatus>,
+    ) -> ProxyViewV1 {
+        let Some(plan) = plan else {
+            return Self::build(input);
+        };
+        let mut view = Self::build(input);
+        for group in &mut view.groups {
+            if plan.groups.iter().any(|planned| planned.name == group.name) {
+                let enhancement = status
+                    .remove(&group.name)
+                    .unwrap_or_else(|| GroupStatus::unsupported("Native adaptive status is unavailable"));
+                let scores: BTreeMap<_, _> = enhancement
+                    .candidates
+                    .iter()
+                    .filter_map(|candidate| {
+                        candidate
+                            .score
+                            .filter(|score| score.is_finite())
+                            .map(|score| (candidate.name.as_str(), score))
+                    })
+                    .collect();
+                if !scores.is_empty() {
+                    group.members.sort_by(|left, right| {
+                        let left = member_name(left);
+                        let right = member_name(right);
+                        match (scores.get(left), scores.get(right)) {
+                            (Some(a), Some(b)) => b.total_cmp(a).then_with(|| left.cmp(right)),
+                            (Some(_), None) => std::cmp::Ordering::Less,
+                            (None, Some(_)) => std::cmp::Ordering::Greater,
+                            (None, None) => left.cmp(right),
+                        }
+                    });
+                }
+                group.enhancement = Some(enhancement);
+            } else if let Some(unsupported) = plan.unsupported.iter().find(|planned| planned.name == group.name) {
+                group.enhancement = Some(GroupStatus {
+                    state: "unsupported".into(),
+                    reason: Some(unsupported.reason.clone()),
+                    candidates: Vec::new(),
+                });
+            }
+        }
+        view
+    }
+
     pub fn build(input: ProxyViewInput) -> ProxyViewV1 {
         let ProxyViewInput {
             runtime_group_order,
@@ -473,6 +525,15 @@ fn build_group(name: String, proxy: Proxy, resolver: &MemberResolver<'_>) -> Pro
             smux,
         },
         members,
+        enhancement: None,
+    }
+}
+
+fn member_name(member: &ProxyMemberRef) -> &str {
+    match member {
+        ProxyMemberRef::Group { name }
+        | ProxyMemberRef::Node { name, .. }
+        | ProxyMemberRef::Unresolved { name, .. } => name,
     }
 }
 
@@ -556,7 +617,157 @@ fn build_standalone(core_node_ids: &BTreeMap<String, String>) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::Context as _;
     use serde_json::json;
+
+    fn enhancement_plan() -> anyhow::Result<EnhancementPlan> {
+        let config = serde_yaml_ng::from_str(
+            "proxies: [{name: fast, type: ss}, {name: slow, type: ss}]\nproxy-groups: [{name: LB, type: load-balance, strategy: round-robin, proxies: [slow, fast]}]",
+        )?;
+        let (_, plan) = crate::enhance::load_balance::transform(config, true)?;
+        plan.ok_or_else(|| anyhow::anyhow!("expected enhancement plan"))
+    }
+
+    #[test]
+    fn enhancement_keeps_original_members_provider_sources_and_user_names() -> anyhow::Result<()> {
+        let plan = enhancement_plan()?;
+        let proxies: Proxies = serde_json::from_value(json!({"proxies": {
+            "GLOBAL": {"all": ["LB", "__verge_lb_user"], "now": "LB", "type": "Selector"},
+            "LB": {"all": ["slow", "fast"], "now": "slow", "type": "LoadBalance"},
+            "__verge_lb_user": {"name": "__verge_lb_user"},
+            "fast": {"name": "fast", "provider-name": "provider"},
+            "slow": {"name": "slow", "provider-name": "provider"}
+        }}))?;
+        let providers = serde_json::from_value(json!({"providers": {
+            "other": {"vehicleType": "Inline", "proxies": [{"name": "fast"}]},
+            "provider": {"vehicleType": "Inline", "proxies": [{"name": "fast"}, {"name": "slow"}]}
+        }}))?;
+        let view = ProxyViewBuilder::build_enhanced(
+            ProxyViewInput {
+                runtime_group_order: vec!["LB".into()],
+                group_scopes: BTreeMap::from([(
+                    "LB".into(),
+                    GroupScope {
+                        providers: vec!["provider".into()],
+                        exclude_types: vec![],
+                    },
+                )]),
+                proxies,
+                providers: Some(providers),
+            },
+            Some(&plan),
+            BTreeMap::new(),
+        );
+        assert_eq!(view.groups.len(), 1);
+        assert_eq!(
+            view.groups[0].members.iter().map(member_name).collect::<Vec<_>>(),
+            ["slow", "fast"]
+        );
+        assert_eq!(view.groups[0].now.as_deref(), Some("slow"));
+        let status = view.groups[0].enhancement.as_ref().context("missing native status")?;
+        assert_eq!(status.state, "unsupported");
+        assert!(status.reason.is_some());
+        assert!(view.records.values().any(|node| node.name == "__verge_lb_user"));
+        let global = view.global.context("global view")?;
+        assert_eq!(global.now.as_deref(), Some("LB"));
+        assert_eq!(
+            global.members.iter().map(member_name).collect::<Vec<_>>(),
+            ["LB", "__verge_lb_user"]
+        );
+        for member in &view.groups[0].members {
+            let ProxyMemberRef::Node { record_id, .. } = member else {
+                anyhow::bail!("expected original provider node")
+            };
+            assert!(
+                matches!(&view.records[record_id].source, ProxyNodeSource::Provider { provider_name, .. } if provider_name == "provider")
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn enhancement_ranks_finite_scores_with_deterministic_ties() -> anyhow::Result<()> {
+        let plan = enhancement_plan()?;
+        let proxies = serde_json::from_value(json!({"proxies": {
+            "LB": {"all": ["unknown", "slow", "fast"], "type": "LoadBalance"},
+            "fast": {"name": "fast"}, "slow": {"name": "slow"}, "unknown": {"name": "unknown"}
+        }}))?;
+        let candidate = |name: &str, score: f64| crate::core::load_balance::CandidateStatus {
+            name: name.into(),
+            score: Some(score),
+            selected: true,
+            reachable: true,
+            fresh_health: true,
+            proven: true,
+            confidence: 1.0,
+            mean_rate: 1.0,
+            peak_rate: 1.0,
+            latency_ms: Some(20.0),
+            state: "selected".into(),
+            cooldown_remaining_seconds: None,
+            last_checked_seconds_ago: None,
+        };
+        let status = BTreeMap::from([(
+            "LB".into(),
+            GroupStatus {
+                state: "active".into(),
+                reason: None,
+                candidates: vec![
+                    candidate("slow", 80.0),
+                    candidate("fast", 80.0),
+                    candidate("unknown", f64::NAN),
+                ],
+            },
+        )]);
+        let view = ProxyViewBuilder::build_enhanced(
+            ProxyViewInput {
+                runtime_group_order: vec!["LB".into()],
+                group_scopes: BTreeMap::new(),
+                proxies,
+                providers: None,
+            },
+            Some(&plan),
+            status,
+        );
+        assert_eq!(
+            view.groups[0].members.iter().map(member_name).collect::<Vec<_>>(),
+            ["fast", "slow", "unknown"]
+        );
+        assert_eq!(
+            view.groups[0].enhancement.as_ref().map(|status| status.state.as_str()),
+            Some("active")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn unsupported_groups_keep_original_members_and_explain_why() -> anyhow::Result<()> {
+        let config = serde_yaml_ng::from_str(
+            "proxy-groups: [{name: LB, type: load-balance, strategy: round-robin, proxies: [DIRECT]}]",
+        )?;
+        let (_, plan) = crate::enhance::load_balance::transform(config, true)?;
+        let proxies = serde_json::from_value(json!({"proxies": {
+            "LB": {"all": ["DIRECT"], "type": "LoadBalance"}, "DIRECT": {"name": "DIRECT", "type": "Direct"}
+        }}))?;
+        let view = ProxyViewBuilder::build_enhanced(
+            ProxyViewInput {
+                runtime_group_order: vec!["LB".into()],
+                group_scopes: BTreeMap::new(),
+                proxies,
+                providers: None,
+            },
+            plan.as_ref(),
+            BTreeMap::new(),
+        );
+        assert_eq!(
+            view.groups[0].members.iter().map(member_name).collect::<Vec<_>>(),
+            ["DIRECT"]
+        );
+        let status = view.groups[0].enhancement.as_ref().context("unsupported status")?;
+        assert_eq!(status.state, "unsupported");
+        assert!(status.reason.as_ref().is_some_and(|reason| !reason.is_empty()));
+        Ok(())
+    }
 
     #[test]
     fn provider_echo_in_proxies_does_not_override_group_membership() -> anyhow::Result<()> {

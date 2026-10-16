@@ -16,11 +16,13 @@
         "systemProxy": "System Proxy"
       },
       "tooltips": {
-        "silentStart": "Start the program in background mode without displaying the panel"
+        "silentStart": "Start the program in background mode without displaying the panel",
+        "loadBalanceEnhanced": "Initially selects up to 3 confirmed healthy nodes with the lowest latency, then favors actual transfer performance. The core selects and rotates nodes autonomously, even with the app window hidden; the client only displays results. Uses only Clash’s built-in tests at the configured URL, with no extra speed-test downloads. Requires bundled custom Mihomo v1.19.32-verge-adaptive1 and an explicitly configured round-robin group. Both Adaptive core entries use the same custom core. Unsupported groups keep their original behavior; disabling restores source settings. Toggling may briefly affect connections."
       },
       "fields": {
         "autoLaunch": "Auto Launch",
-        "silentStart": "Silent Start"
+        "silentStart": "Silent Start",
+        "loadBalanceEnhanced": "Enhanced Load Balancing"
       },
       "notifications": {
         "tunMode": {
@@ -303,9 +305,10 @@
     },
     "clashCore": {
       "variants": {
-        "release": "Release Version",
-        "alpha": "Alpha Version"
-      }
+        "release": "Adaptive",
+        "alpha": "Adaptive (compatibility entry)"
+      },
+      "upgradeUnavailable": "This version uses a custom core. Install an updated custom-core application build to upgrade it."
     },
     "liteMode": {
       "title": "LightWeight Mode Settings",

@@ -1,6 +1,7 @@
 import { afterEach, expect, test, vi } from 'vitest'
 
 import delayManager from '@/services/delay'
+import type { ProxyGroupView } from '@/types/proxy-view'
 import { compareByDelay } from '@/utils/delay'
 
 import { filterSort } from './use-filter-sort'
@@ -26,6 +27,133 @@ const node = (memberIndex: number, delay: number, name = `${memberIndex}`) =>
   }) as unknown as ResolvedMemberOccurrence
 
 afterEach(() => vi.restoreAllMocks())
+
+const enhancedGroup: Pick<ProxyGroupView, 'type' | 'enhancement'> = {
+  type: 'LoadBalance',
+  enhancement: {
+    state: 'trial',
+    reason: null,
+    candidates: (
+      [
+        ['b-standby', 100, false, 'standby'],
+        ['x-trial', 95, true, 'trial'],
+        ['z-primary', 90, true, 'selected'],
+        ['a-paused', 85, false, 'standby'],
+        ['y-primary', 80, true, 'selected'],
+        ['d-waiting-trial', 70, false, 'trial'],
+        ['c-standby', 60, false, 'standby'],
+      ] as const
+    ).map(([name, score, selected, state]) => ({
+      name,
+      score,
+      selected,
+      state,
+      reachable: true,
+      freshHealth: true,
+      proven: true,
+      confidence: 1,
+      meanRate: null,
+      peakRate: null,
+      latencyMs: null,
+      cooldownRemainingSeconds: null,
+      lastCheckedSecondsAgo: null,
+    })),
+  },
+}
+
+const enhancedMembers = () => [
+  node(0, 1, 'b-standby'),
+  node(1, 700, 'y-primary'),
+  node(2, 4, 'a-paused'),
+  node(3, 3, 'd-waiting-trial'),
+  node(4, 600, 'x-trial'),
+  node(5, 900, 'z-primary'),
+  node(6, 2, 'c-standby'),
+]
+
+test.each([
+  [0, [5, 1, 4, 0, 2, 3, 6]],
+  [1, [5, 1, 4, 0, 6, 3, 2]],
+  [2, [5, 1, 4, 2, 0, 6, 3]],
+] as const)(
+  'pins actual selected slots before trials with client sort %i',
+  (sortType, order) => {
+    vi.spyOn(Date, 'now').mockReturnValue(1000)
+    const list = enhancedMembers()
+    const before = list.slice()
+    const candidates = enhancedGroup.enhancement!.candidates.slice()
+    const result = filterSort(
+      list,
+      'enhanced',
+      '',
+      sortType,
+      undefined,
+      undefined,
+      enhancedGroup,
+    )
+    expect(result).toEqual(order.map((index) => list[index]))
+    expect(list).toEqual(before)
+    expect(enhancedGroup.enhancement!.candidates).toEqual(candidates)
+  },
+)
+
+test('keeps explicit filters without restoring hidden selected nodes', () => {
+  const list = enhancedMembers()
+  expect(
+    filterSort(
+      list,
+      'enhanced-filter',
+      'standby',
+      2,
+      undefined,
+      undefined,
+      enhancedGroup,
+    ),
+  ).toEqual([list[0], list[6]])
+  expect(
+    filterSort(
+      list,
+      'enhanced-filter',
+      'primary',
+      2,
+      undefined,
+      undefined,
+      enhancedGroup,
+    ),
+  ).toEqual([list[5], list[1]])
+  expect(
+    filterSort(
+      list,
+      'enhanced-filter',
+      'missing',
+      2,
+      undefined,
+      undefined,
+      enhancedGroup,
+    ),
+  ).toEqual([])
+})
+
+test('does not pin ordinary, disabled or unsupported groups', () => {
+  vi.spyOn(Date, 'now').mockReturnValue(1000)
+  const list = enhancedMembers()
+  const groups: Pick<ProxyGroupView, 'type' | 'enhancement'>[] = [
+    { type: 'LoadBalance', enhancement: null },
+    {
+      type: 'LoadBalance',
+      enhancement: { ...enhancedGroup.enhancement!, state: 'unsupported' },
+    },
+    { type: 'Selector', enhancement: enhancedGroup.enhancement },
+  ]
+  for (const sortType of [0, 1, 2] as const) {
+    const expected = filterSort(list, 'ordinary', '', sortType)
+    for (const group of groups) {
+      expect(
+        filterSort(list, 'ordinary', '', sortType, undefined, undefined, group),
+      ).toEqual(expected)
+    }
+  }
+})
 
 test('matches the previous comparator for cached, fallback and sentinel delays', () => {
   vi.spyOn(Date, 'now').mockReturnValue(1000)

@@ -16,11 +16,13 @@
         "systemProxy": "Proxy do Sistema"
       },
       "tooltips": {
-        "silentStart": "Inicia o programa em segundo plano sem exibir o painel"
+        "silentStart": "Inicia o programa em segundo plano sem exibir o painel",
+        "loadBalanceEnhanced": "Inicialmente escolhe até 3 nós com disponibilidade confirmada e menor latência; depois prioriza o desempenho real de transferência. O núcleo seleciona e alterna os nós de forma autônoma, mesmo com a janela oculta; o cliente apenas exibe os resultados. Usa somente os testes integrados do Clash com a URL configurada, sem downloads extras para medir a velocidade. Requer o Mihomo personalizado v1.19.32-verge-adaptive1 incluído e um grupo configurado explicitamente como round-robin. As duas opções adaptativas usam o mesmo núcleo personalizado. Grupos incompatíveis mantêm o funcionamento original; desativar restaura a configuração de origem. Alternar esta opção pode afetar brevemente as conexões."
       },
       "fields": {
         "autoLaunch": "Iniciar com o Sistema",
-        "silentStart": "Início Silencioso"
+        "silentStart": "Início Silencioso",
+        "loadBalanceEnhanced": "Balanceamento de Carga Aprimorado"
       },
       "notifications": {
         "tunMode": {
@@ -303,9 +305,10 @@
     },
     "clashCore": {
       "variants": {
-        "release": "Versão Release",
-        "alpha": "Versão Alpha"
-      }
+        "release": "Adaptativo",
+        "alpha": "Adaptativo (opção de compatibilidade)"
+      },
+      "upgradeUnavailable": "Esta versão usa um núcleo personalizado. Para atualizá-lo, instale uma versão mais recente do aplicativo com o núcleo personalizado."
     },
     "liteMode": {
       "title": "Configurações do Modo Leve",

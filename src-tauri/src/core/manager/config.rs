@@ -165,6 +165,7 @@ impl CoreManager {
             *d = IRuntime {
                 config: Some(clash_config.to_owned()),
                 dns_override: None,
+                load_balance: None,
                 exists_keys: HashSet::new(),
                 chain_logs: Default::default(),
             }

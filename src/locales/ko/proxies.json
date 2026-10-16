@@ -1,5 +1,45 @@
 {
   "page": {
+    "enhancement": {
+      "states": {
+        "warming": "아직 살펴보는 중",
+        "active": "알맞은 노드를 골라드리는 중",
+        "probing": "지연 시간 확인 중",
+        "trial": "소수 연결로 시험 사용 중",
+        "cooldown": "잠시 쉬고 다시 시도",
+        "draining": "이전 연결이 끝나기를 기다리는 중",
+        "unavailable": "지금은 쓸 수 있는 노드가 없어요",
+        "quarantined": "잠시 사용 중지",
+        "unsupported": "이 그룹은 아직 지원하지 않아요"
+      },
+      "descriptions": {
+        "warming": "먼저 각 노드가 얼마나 잘 되는지 살펴봐요",
+        "active": "지금 잘 되는 노드를 우선 사용해요",
+        "probing": "Clash 내장 지연 시간 테스트를 재사용하거나 갱신해요. 별도의 속도 측정 파일은 다운로드하지 않아요",
+        "trial": "몇 개의 새 연결로 예비 노드를 조금 써보고 있어요",
+        "cooldown": "잠시 후 다시 시도해요. 다른 사용 가능한 노드에는 영향을 주지 않아요",
+        "draining": "이전 연결을 아직 쓰고 있어서 자연스럽게 끝나기를 기다려요",
+        "unavailable": "연결할 수 있는 노드를 아직 찾지 못했어요",
+        "quarantined": "연결 상태를 확인하고 있어요. 당분간 새 연결은 배정하지 않아요",
+        "unsupported": "당분간 원래 연결 방식을 그대로 사용해요"
+      },
+      "candidates": {
+        "probing": "확인 중",
+        "trial": "소수 연결로 시험 사용 중",
+        "selected": "사용 중",
+        "cooldown": "잠시 쉬고 다시 시도",
+        "standby": "예비",
+        "untested": "아직 살펴보는 중",
+        "unavailable": "지금은 연결이 안 돼요"
+      },
+      "insufficientEvidence": "아직 살펴보는 중",
+      "keepObserving": "조금 더 써보며 살펴봐요",
+      "technicalDetails": "자세한 이유 (문제 확인용)",
+      "score": "점수 {{score}}",
+      "retryRemaining": "{{seconds}}초 후 다시 시도",
+      "checkRecency": "{{seconds}}초 전에 확인",
+      "notChecked": "아직 확인하지 않음"
+    },
     "modes": {
       "rule": "규칙",
       "global": "전역",

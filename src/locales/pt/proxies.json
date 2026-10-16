@@ -1,5 +1,45 @@
 {
   "page": {
+    "enhancement": {
+      "states": {
+        "warming": "Ainda observando",
+        "active": "Escolhendo nós para você",
+        "probing": "Verificando latência",
+        "trial": "Teste limitado",
+        "cooldown": "Tentaremos de novo mais tarde",
+        "draining": "Deixando as conexões anteriores terminarem",
+        "unavailable": "Nenhum nó utilizável por enquanto",
+        "quarantined": "Em pausa por enquanto",
+        "unsupported": "Este grupo ainda não é compatível"
+      },
+      "descriptions": {
+        "warming": "Primeiro vemos como cada nó se comporta",
+        "active": "Damos preferência aos nós que funcionam bem agora",
+        "probing": "Reutilizando ou atualizando os testes de latência integrados do Clash, sem baixar arquivos extras para medir a velocidade",
+        "trial": "Experimentamos um nó de reserva com poucas conexões novas",
+        "cooldown": "Tentaremos mais tarde sem afetar os outros nós utilizáveis",
+        "draining": "As conexões anteriores ainda estão em uso e podem terminar naturalmente",
+        "unavailable": "Ainda não encontramos nós que consigam se conectar",
+        "quarantined": "Verificamos o estado das conexões; por enquanto não atribuímos novas conexões",
+        "unsupported": "Por enquanto mantemos a forma de conexão original"
+      },
+      "candidates": {
+        "probing": "Verificando",
+        "trial": "Teste limitado",
+        "selected": "Em uso",
+        "cooldown": "Tentaremos de novo mais tarde",
+        "standby": "Reserva",
+        "untested": "Ainda observando",
+        "unavailable": "Não consegue conectar agora"
+      },
+      "insufficientEvidence": "Ainda observando",
+      "keepObserving": "Vamos ver como continua",
+      "technicalDetails": "Motivo detalhado (para resolver problemas)",
+      "score": "Pontuação {{score}}",
+      "retryRemaining": "Nova tentativa em {{seconds}} s",
+      "checkRecency": "Verificado há {{seconds}} s",
+      "notChecked": "Ainda não verificado"
+    },
     "modes": {
       "rule": "Regra",
       "global": "Global",
