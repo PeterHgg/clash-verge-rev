@@ -12,8 +12,9 @@ import { tmpdir } from 'node:os'
 import { basename, join, resolve } from 'node:path'
 
 const [coreOutput, artifactOutput] = process.argv
-  .slice(2)
+  .slice(2, 4)
   .map((path) => resolve(path))
+const appOnly = process.argv[4] === '--app'
 const target = process.env.ADAPTIVE_TARGET
 if (!coreOutput || !artifactOutput || !target)
   throw new Error('Expected core output, artifact output and ADAPTIVE_TARGET')
@@ -52,6 +53,9 @@ if (windows) {
   )
   if (cores.length !== 1) throw new Error('Expected one packaged stable core')
   coreDirectory = resolve(cores[0], '..')
+} else if (appOnly) {
+  installers = []
+  coreDirectory = join(bundle, 'macos', 'Clash Verge.app', 'Contents', 'MacOS')
 } else {
   installers = findFiles(join(bundle, 'dmg')).filter((path) =>
     path.endsWith('.dmg'),
@@ -68,6 +72,8 @@ if (windows) {
   ])
   process.on('exit', () => spawnSync('hdiutil', ['detach', mount]))
   coreDirectory = join(mount, 'Clash Verge.app', 'Contents', 'MacOS')
+}
+if (!windows) {
   const app = resolve(coreDirectory, '..', '..')
   run('codesign', ['--verify', '--deep', '--strict', '--verbose=2', app])
   const arch = target.startsWith('aarch64') ? 'arm64' : 'x86_64'
@@ -108,8 +114,25 @@ const version = run(stable, ['-v']).trim()
 if (!version.includes('v1.19.32-verge-adaptive1'))
   throw new Error(`Wrong packaged version: ${version}`)
 mkdirSync(artifactOutput, { recursive: true })
-for (const installer of installers)
-  copyFileSync(installer, join(artifactOutput, basename(installer)))
+if (appOnly) {
+  const archive = join(
+    artifactOutput,
+    'Clash.Verge_2.5.9_arm64_Adaptive.app.zip',
+  )
+  run('ditto', [
+    '-c',
+    '-k',
+    '--sequesterRsrc',
+    '--keepParent',
+    resolve(coreDirectory, '..', '..'),
+    archive,
+  ])
+  installers.push(archive)
+}
+for (const installer of installers) {
+  const destination = join(artifactOutput, basename(installer))
+  if (installer !== destination) copyFileSync(installer, destination)
+}
 copyFileSync(
   join(coreOutput, 'build.json'),
   join(artifactOutput, 'core-build.json'),

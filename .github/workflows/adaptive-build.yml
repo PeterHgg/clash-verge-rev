@@ -1,4 +1,4 @@
-name: Adaptive test packages
+name: Adaptive Apple Silicon test package
 
 on:
   workflow_dispatch:
@@ -23,15 +23,11 @@ jobs:
     if: github.repository == 'PeterHgg/clash-verge-rev'
     strategy:
       fail-fast: false
-      max-parallel: 3
+      max-parallel: 1
       matrix:
         include:
           - os: macos-15
             target: aarch64-apple-darwin
-          - os: macos-15-intel
-            target: x86_64-apple-darwin
-          - os: windows-2025
-            target: x86_64-pc-windows-msvc
     runs-on: ${{ matrix.os }}
     timeout-minutes: 120
     defaults:
@@ -71,18 +67,38 @@ jobs:
         run: pnpm run prebuild "${{ matrix.target }}"
       - name: Build and bundle both custom core entries
         run: node scripts/mihomo-local-build.mjs --target "${{ matrix.target }}" --output "$RUNNER_TEMP/adaptive-core" --bundle
-      - name: Build unsigned test installer
+      - name: Build ad-hoc signed application
         # Do not use pnpm build: its prebuild lifecycle could replace the custom cores.
         run: |
-          node --input-type=module -e 'import {writeFileSync} from "node:fs"; writeFileSync("adaptive-test.conf.json", JSON.stringify({bundle:{createUpdaterArtifacts:false,...(process.platform === "darwin" ? {macOS:{signingIdentity:"-"}} : {})}}))'
-          pnpm exec tauri build --target "${{ matrix.target }}" --config "$GITHUB_WORKSPACE/adaptive-test.conf.json"
-      - name: Verify packaged cores and collect artifacts
+          node --input-type=module -e 'import {writeFileSync} from "node:fs"; writeFileSync("adaptive-test.conf.json", JSON.stringify({bundle:{createUpdaterArtifacts:false,macOS:{signingIdentity:"-"}}}))'
+          pnpm exec tauri build --target "${{ matrix.target }}" --bundles app --config "$GITHUB_WORKSPACE/adaptive-test.conf.json"
+      - name: Verify application and archive
         env:
           ADAPTIVE_TARGET: ${{ matrix.target }}
-        run: node scripts/adaptive-artifacts.mjs "$RUNNER_TEMP/adaptive-core" "$RUNNER_TEMP/adaptive-artifacts"
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        run: node scripts/adaptive-artifacts.mjs "$RUNNER_TEMP/adaptive-core" "$RUNNER_TEMP/adaptive-app-artifacts" --app
+      - name: Upload verified application archive
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: Adaptive-2.5.9-${{ matrix.target }}
-          path: ${{ runner.temp }}/adaptive-artifacts/*
+          name: Adaptive-2.5.9-arm64-app
+          path: ${{ runner.temp }}/adaptive-app-artifacts/*
+          if-no-files-found: error
+          retention-days: 30
+      - name: Create DMG without Finder automation
+        run: |
+          set -euxo pipefail
+          staging="$(mktemp -d "$RUNNER_TEMP/adaptive-dmg-stage.XXXXXX")"
+          ditto "target/${{ matrix.target }}/release/bundle/macos/Clash Verge.app" "$staging/Clash Verge.app"
+          ln -s /Applications "$staging/Applications"
+          mkdir -p "target/${{ matrix.target }}/release/bundle/dmg"
+          hdiutil create -volname "Clash Verge" -srcfolder "$staging" -format UDZO "target/${{ matrix.target }}/release/bundle/dmg/Clash.Verge_2.5.9_arm64_Adaptive.dmg"
+      - name: Verify final DMG and collect artifacts
+        env:
+          ADAPTIVE_TARGET: ${{ matrix.target }}
+        run: node scripts/adaptive-artifacts.mjs "$RUNNER_TEMP/adaptive-core" "$RUNNER_TEMP/adaptive-dmg-artifacts"
+      - name: Upload verified DMG
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: Adaptive-2.5.9-arm64-dmg
+          path: ${{ runner.temp }}/adaptive-dmg-artifacts/*
           if-no-files-found: error
           retention-days: 30
