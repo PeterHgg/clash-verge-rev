@@ -1014,6 +1014,118 @@ export interface TranslationResources {
           }
           title: string
         }
+        cloudflare: {
+          apply: string
+          bindingsTitle: string
+          capabilityNotice: string
+          confirmationFailed: string
+          diagnostics: {
+            contentType: string
+            contentTypes: {
+              binary: string
+              html: string
+              json: string
+              missing: string
+              other: string
+              plain: string
+            }
+            httpStatus: string
+            reasons: {
+              bodyReadFailed: string
+              cancelled: string
+              deadlineExceeded: string
+              forbidden: string
+              httpStatus: string
+              interfaceChanged: string
+              noCandidates: string
+              noCompletedResults: string
+              noEligibleAddresses: string
+              noMeasuredData: string
+              rateLimited: string
+              requestFailed: string
+              resolutionFailed: string
+              serverError: string
+              setupTimeout: string
+              tcpFailed: string
+              tlsFailed: string
+              unsupportedContent: string
+              unsupportedEncoding: string
+            }
+            retryAfter: string
+            stages: {
+              body: string
+              cancel: string
+              content: string
+              dns: string
+              headers: string
+              http: string
+              interface: string
+              tcp: string
+              tls: string
+            }
+          }
+          downloaded: string
+          dynamic: string
+          failures: string
+          finishReasons: {
+            eof: string
+            quota: string
+            window: string
+          }
+          fixed: string
+          interface: string
+          ipSource: string
+          latency: string
+          meanMbps: string
+          notApplied: string
+          notSaved: string
+          notTested: string
+          p90Mbps: string
+          resultStates: {
+            complete: string
+            failed: string
+            pending: string
+            screened: string
+            short: string
+            untested: string
+          }
+          resultsTitle: string
+          roundCounts: string
+          sample: string
+          sampleCounts: string
+          score: string
+          sourceDomain: string
+          sourceStates: {
+            complete: string
+            completed: string
+            failed: string
+            pending: string
+            ready: string
+            resolved: string
+            resolving: string
+            untested: string
+          }
+          stability: string
+          stages: {
+            complete: string
+            downloading: string
+            resolving: string
+            screening: string
+          }
+          stale: string
+          start: string
+          state: string
+          states: {
+            cancelled: string
+            completed: string
+            failed: string
+            running: string
+          }
+          target: string
+          testTitle: string
+          testUrl: string
+          title: string
+        }
         dns: {
           dialog: {
             profileScope: string
@@ -1416,6 +1528,7 @@ export interface TranslationResources {
         system: {
           fields: {
             autoLaunch: string
+            cloudflareSpeedTest: string
             loadBalanceEnhanced: string
             silentStart: string
           }

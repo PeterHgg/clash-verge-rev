@@ -37,6 +37,13 @@ export const useAppDispatch = (): AppStoreActionDispatcher => {
 
 export const useRunState = () => useSelector((s) => s.runState)
 
+export const useCloudflareState = () =>
+  useSelector((s) => ({
+    snapshot: s.cloudflareSnapshot,
+    capability: s.cloudflareCapability,
+    error: s.cloudflareError,
+  }))
+
 export const usePendingFailureList = () => useSelector((s) => s.pendingFailures)
 
 export const useSidecarFailure = () => useSelector((s) => s.sidecarFailure)

@@ -1,6 +1,7 @@
 pub mod auto_backup;
 pub mod autostart;
 pub mod backup;
+pub(crate) mod cloudflare_speed_test;
 pub mod hotkey;
 pub mod lightweight;
 pub mod listener;

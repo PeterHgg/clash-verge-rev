@@ -97,6 +97,35 @@ export const commands = {
       enabled,
       confirmation,
     }),
+  getCloudflareSpeedTest: () =>
+    __TAURI_INVOKE<CloudflareSpeedTestView_Serialize>(
+      'get_cloudflare_speed_test',
+    ),
+  startCloudflareSpeedTest: (url: string, interfaceName: string | null) =>
+    __TAURI_INVOKE<CloudflareSnapshot_Serialize>(
+      'start_cloudflare_speed_test',
+      { url, interfaceName },
+    ),
+  cancelCloudflareSpeedTest: (runId: string) =>
+    __TAURI_INVOKE<CloudflareSnapshot_Serialize>(
+      'cancel_cloudflare_speed_test',
+      { runId },
+    ),
+  getCloudflareDnsInventory: () =>
+    __TAURI_INVOKE<CloudflareDnsInventory_Serialize>(
+      'get_cloudflare_dns_inventory',
+    ),
+  setCloudflareDnsBindings: (
+    profileUid: string,
+    fingerprint: string,
+    bindings: CloudflareDnsBinding[],
+    enabled: boolean,
+    confirmation: string | null,
+  ) =>
+    __TAURI_INVOKE<CloudflareDnsOutcome_Serialize>(
+      'set_cloudflare_dns_bindings',
+      { profileUid, fingerprint, bindings, enabled, confirmation },
+    ),
   takeDnsOverrideNotice: () =>
     __TAURI_INVOKE<boolean>('take_dns_override_notice'),
   takeServiceFallbackNotice: () =>
@@ -261,6 +290,404 @@ export type ClashInfo = {
   secret: string | null
 }
 
+export type CloudflareBindingTarget =
+  | { kind: 'preferred_domain'; domain: string }
+  | { kind: 'fixed_ip'; ip: string; runId: string }
+
+export type CloudflareCapability =
+  | CloudflareCapability_Serialize
+  | CloudflareCapability_Deserialize
+
+export type CloudflareCapability_Deserialize = {
+  schemaVersion: number
+  capability: string
+  supported: boolean
+  preferredDomains: string[]
+  budgetBytes: number
+  domainOnly?: boolean
+  engineVersion?: string
+  method?: string
+  latencyMethod?: string
+  dnsAliases?: boolean
+  fixedAddressFamily?: boolean
+  reason: string | null
+}
+
+export type CloudflareCapability_Serialize = {
+  schemaVersion: number
+  capability: string
+  supported: boolean
+  preferredDomains: string[]
+  budgetBytes: number
+  domainOnly: boolean
+  engineVersion: string
+  method: string
+  latencyMethod: string
+  dnsAliases: boolean
+  fixedAddressFamily: boolean
+  reason?: string | null
+}
+
+export type CloudflareContentType =
+  | 'binary'
+  | 'plain'
+  | 'html'
+  | 'json'
+  | 'other'
+  | 'missing'
+
+export type CloudflareDiagnostic =
+  | CloudflareDiagnostic_Serialize
+  | CloudflareDiagnostic_Deserialize
+
+export type CloudflareDiagnosticCode =
+  | 'resolution_failed'
+  | 'no_eligible_addresses'
+  | 'interface_changed'
+  | 'tcp_failed'
+  | 'tls_failed'
+  | 'setup_timeout'
+  | 'request_failed'
+  | 'http_status'
+  | 'rate_limited'
+  | 'unsupported_encoding'
+  | 'unsupported_content'
+  | 'body_read_failed'
+  | 'no_measured_data'
+  | 'cancelled'
+  | 'deadline_exceeded'
+  | 'no_candidates'
+  | 'no_completed_results'
+
+export type CloudflareDiagnosticStage =
+  | 'dns'
+  | 'interface'
+  | 'tcp'
+  | 'tls'
+  | 'headers'
+  | 'http'
+  | 'content'
+  | 'body'
+  | 'cancel'
+
+export type CloudflareDiagnostic_Deserialize = {
+  stage: CloudflareDiagnosticStage
+  code: CloudflareDiagnosticCode
+  httpStatus: number | null
+  contentType: CloudflareContentType | null
+  retryAfterSeconds: number | null
+}
+
+export type CloudflareDiagnostic_Serialize = {
+  stage: CloudflareDiagnosticStage
+  code: CloudflareDiagnosticCode
+  httpStatus?: number | null
+  contentType?: CloudflareContentType | null
+  retryAfterSeconds?: number | null
+}
+
+export type CloudflareDnsBinding = {
+  domain: string
+  target: CloudflareBindingTarget
+}
+
+export type CloudflareDnsInventory =
+  | CloudflareDnsInventory_Serialize
+  | CloudflareDnsInventory_Deserialize
+
+export type CloudflareDnsInventory_Deserialize = {
+  profileUid: string
+  fingerprint: string
+  domains: CloudflareDomain_Deserialize[]
+  bindings: CloudflareDnsBinding[]
+  enabled: boolean
+  effectiveEnabled: boolean
+  useHosts: boolean | null
+  unknownSources: string[]
+  warnings: string[]
+}
+
+export type CloudflareDnsInventory_Serialize = {
+  profileUid: string
+  fingerprint: string
+  domains: CloudflareDomain_Serialize[]
+  bindings: CloudflareDnsBinding[]
+  enabled: boolean
+  effectiveEnabled: boolean
+  useHosts: boolean | null
+  unknownSources: string[]
+  warnings: string[]
+}
+
+export type CloudflareDnsOutcome =
+  | CloudflareDnsOutcome_Serialize
+  | CloudflareDnsOutcome_Deserialize
+
+export type CloudflareDnsOutcome_Deserialize =
+  | ({ status: 'applied'; saved: boolean; error: string | null } & {
+      affectedDomains?: never
+      confirmation?: never
+      conflicts?: never
+      enableUseHosts?: never
+      reason?: never
+      warnings?: never
+    })
+  | ({ status: 'stale'; reason: string } & {
+      affectedDomains?: never
+      confirmation?: never
+      conflicts?: never
+      enableUseHosts?: never
+      error?: never
+      saved?: never
+      warnings?: never
+    })
+  | ({
+      status: 'confirmation_required'
+      confirmation: string
+      conflicts: string[]
+      enableUseHosts: boolean
+      affectedDomains: string[]
+      warnings: string[]
+    } & { error?: never; reason?: never; saved?: never })
+
+export type CloudflareDnsOutcome_Serialize =
+  | ({ status: 'applied'; saved: boolean; error?: string | null } & {
+      affectedDomains?: never
+      confirmation?: never
+      conflicts?: never
+      enableUseHosts?: never
+      reason?: never
+      warnings?: never
+    })
+  | ({ status: 'stale'; reason: string } & {
+      affectedDomains?: never
+      confirmation?: never
+      conflicts?: never
+      enableUseHosts?: never
+      error?: never
+      saved?: never
+      warnings?: never
+    })
+  | ({
+      status: 'confirmation_required'
+      confirmation: string
+      conflicts: string[]
+      enableUseHosts: boolean
+      affectedDomains: string[]
+      warnings: string[]
+    } & { error?: never; reason?: never; saved?: never })
+
+export type CloudflareDomain =
+  | CloudflareDomain_Serialize
+  | CloudflareDomain_Deserialize
+
+export type CloudflareDomain_Deserialize = {
+  domain: string
+  occurrences: CloudflareOccurrence_Deserialize[]
+  bindable: boolean
+  reason: string | null
+}
+
+export type CloudflareDomain_Serialize = {
+  domain: string
+  occurrences: CloudflareOccurrence_Serialize[]
+  bindable: boolean
+  reason?: string | null
+}
+
+export type CloudflareFinishReason = 'eof' | 'quota' | 'window'
+
+export type CloudflareOccurrence =
+  | CloudflareOccurrence_Serialize
+  | CloudflareOccurrence_Deserialize
+
+export type CloudflareOccurrenceRole =
+  | 'url'
+  | 'dns'
+  | 'proxy_server'
+  | 'identity'
+  | 'subscription'
+
+export type CloudflareOccurrence_Deserialize = {
+  id: string
+  display: string
+  fieldPath: string
+  role: CloudflareOccurrenceRole
+  bindable: boolean
+  reason: string | null
+}
+
+export type CloudflareOccurrence_Serialize = {
+  id: string
+  display: string
+  fieldPath: string
+  role: CloudflareOccurrenceRole
+  bindable: boolean
+  reason?: string | null
+}
+
+export type CloudflareResult =
+  | CloudflareResult_Serialize
+  | CloudflareResult_Deserialize
+
+export type CloudflareResultState =
+  | 'pending'
+  | 'screened'
+  | 'complete'
+  | 'short'
+  | 'failed'
+  | 'untested'
+
+export type CloudflareResult_Deserialize = {
+  ip: string
+  sources: string[]
+  state: CloudflareResultState
+  meanRate: number | null
+  peakRate: number | null
+  latencyMs: number | null
+  stability: number | null
+  score: number | null
+  bytesRead: number
+  durationMs: number
+  failures: number
+  attempts: number
+  successfulRounds: number
+  attemptedRounds: number
+  finishReason: CloudflareFinishReason | null
+  diagnostic: CloudflareDiagnostic_Deserialize | null
+  error: string | null
+}
+
+export type CloudflareResult_Serialize = {
+  ip: string
+  sources: string[]
+  state: CloudflareResultState
+  meanRate?: number | null
+  peakRate?: number | null
+  latencyMs?: number | null
+  stability?: number | null
+  score?: number | null
+  bytesRead: number
+  durationMs: number
+  failures: number
+  attempts: number
+  successfulRounds: number
+  attemptedRounds: number
+  finishReason?: CloudflareFinishReason | null
+  diagnostic?: CloudflareDiagnostic_Serialize | null
+  error?: string | null
+}
+
+export type CloudflareRunState =
+  | 'running'
+  | 'completed'
+  | 'cancelled'
+  | 'failed'
+
+export type CloudflareSnapshot =
+  | CloudflareSnapshot_Serialize
+  | CloudflareSnapshot_Deserialize
+
+export type CloudflareSnapshot_Deserialize = {
+  schemaVersion: number
+  capability: string
+  method: string
+  latencyMethod?: string
+  runId: string
+  revision: number
+  state: CloudflareRunState
+  stage: CloudflareStage
+  interfaceName: string
+  dnsMode: string
+  url: string
+  startedAt: string
+  finishedAt: string | null
+  bytesRead: number
+  budgetBytes: number
+  completedTargets: number
+  totalTargets: number
+  results: CloudflareResult_Deserialize[]
+  sources: CloudflareSource_Deserialize[]
+  diagnostic: CloudflareDiagnostic_Deserialize | null
+  error: string | null
+}
+
+export type CloudflareSnapshot_Serialize = {
+  schemaVersion: number
+  capability: string
+  method: string
+  latencyMethod: string
+  runId: string
+  revision: number
+  state: CloudflareRunState
+  stage: CloudflareStage
+  interfaceName: string
+  dnsMode: string
+  url: string
+  startedAt: string
+  finishedAt?: string | null
+  bytesRead: number
+  budgetBytes: number
+  completedTargets: number
+  totalTargets: number
+  results: CloudflareResult_Serialize[]
+  sources: CloudflareSource_Serialize[]
+  diagnostic?: CloudflareDiagnostic_Serialize | null
+  error?: string | null
+}
+
+export type CloudflareSource =
+  | CloudflareSource_Serialize
+  | CloudflareSource_Deserialize
+
+export type CloudflareSource_Deserialize = {
+  name: string
+  ips: string[]
+  state: string
+  eligibleIpv4: number
+  eligibleIpv6: number
+  truncated: boolean
+  diagnostic: CloudflareDiagnostic_Deserialize | null
+  error: string | null
+}
+
+export type CloudflareSource_Serialize = {
+  name: string
+  ips: string[]
+  state: string
+  eligibleIpv4: number
+  eligibleIpv6: number
+  truncated: boolean
+  diagnostic?: CloudflareDiagnostic_Serialize | null
+  error?: string | null
+}
+
+export type CloudflareSpeedTestUnavailable = {
+  runId: string
+  revision: number
+  reason: string
+}
+
+export type CloudflareSpeedTestView =
+  | CloudflareSpeedTestView_Serialize
+  | CloudflareSpeedTestView_Deserialize
+
+export type CloudflareSpeedTestView_Deserialize = {
+  capability: CloudflareCapability_Deserialize
+  snapshot: CloudflareSnapshot_Deserialize | null
+}
+
+export type CloudflareSpeedTestView_Serialize = {
+  capability: CloudflareCapability_Serialize
+  snapshot: CloudflareSnapshot_Serialize | null
+}
+
+export type CloudflareStage =
+  | 'resolving'
+  | 'screening'
+  | 'downloading'
+  | 'complete'
+
 /**  Structured command failure returned to the frontend. */
 export type CommandFailure =
   | CommandFailure_Serialize
@@ -409,6 +836,9 @@ export type IVerge_Deserialize = {
   /**  Initial DNS override preference for profiles without a saved setting. */
   enable_dns_settings?: boolean | null
   profile_dns_settings?: { [key in string]: ProfileDnsSettings_Deserialize }
+  profile_cloudflare_dns_settings?:
+    | { [key in string]: ProfileCloudflareDnsSettings }
+    | null
   use_default_bypass?: boolean | null
   system_proxy_bypass?: string | null
   proxy_guard_duration?: number | null
@@ -500,6 +930,9 @@ export type IVerge_Serialize = {
   /**  Initial DNS override preference for profiles without a saved setting. */
   enable_dns_settings: boolean | null
   profile_dns_settings?: { [key in string]: ProfileDnsSettings_Serialize }
+  profile_cloudflare_dns_settings?:
+    | { [key in string]: ProfileCloudflareDnsSettings }
+    | null
   use_default_bypass: boolean | null
   system_proxy_bypass: string | null
   proxy_guard_duration: number | null
@@ -751,6 +1184,12 @@ export type PrfOption_Serialize = {
 export type PrfSelected = {
   name?: string | null
   now?: string | null
+}
+
+export type ProfileCloudflareDnsSettings = {
+  enabled?: boolean
+  bindings?: CloudflareDnsBinding[]
+  confirmation?: string | null
 }
 
 export type ProfileCreate = ProfileCreate_Serialize | ProfileCreate_Deserialize
@@ -1060,7 +1499,11 @@ export type ValidationOutcome =
 
 export type ValidationSkipReason = 'exiting' | 'debounced'
 
-export type VergeEventPayloads = {
+export type VergeEventPayloads =
+  | VergeEventPayloads_Serialize
+  | VergeEventPayloads_Deserialize
+
+export type VergeEventPayloads_Deserialize = {
   'verge://refresh-clash-config': null
   'verge://refresh-verge-config': null
   'verge://refresh-profiles': null
@@ -1072,6 +1515,24 @@ export type VergeEventPayloads = {
   'profile-update-completed': ProfileUpdatePayload
   'verge://run-state-changed': RunStateView
   'verge://pending-failures-changed': null
+  'verge://cloudflare-speed-test': CloudflareSnapshot_Deserialize
+  'verge://cloudflare-speed-test-unavailable': CloudflareSpeedTestUnavailable
+}
+
+export type VergeEventPayloads_Serialize = {
+  'verge://refresh-clash-config': null
+  'verge://refresh-verge-config': null
+  'verge://refresh-profiles': null
+  'verge://refresh-proxy-config': null
+  'verge://notice-message': [NoticeStatus, string]
+  'profile-changed': string
+  'verge://timer-updated': string
+  'profile-update-started': ProfileUpdatePayload
+  'profile-update-completed': ProfileUpdatePayload
+  'verge://run-state-changed': RunStateView
+  'verge://pending-failures-changed': null
+  'verge://cloudflare-speed-test': CloudflareSnapshot_Serialize
+  'verge://cloudflare-speed-test-unavailable': CloudflareSpeedTestUnavailable
 }
 
 export type WebDavFile = {

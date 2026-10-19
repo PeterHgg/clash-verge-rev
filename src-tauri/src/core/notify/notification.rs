@@ -35,6 +35,12 @@ pub enum FrontendEvent<'a> {
         state: crate::core::runstate::RunStateView,
     },
     PendingFailuresChanged,
+    CloudflareSpeedTest {
+        snapshot: crate::config::cloudflare_speed_test::CloudflareSnapshot,
+    },
+    CloudflareSpeedTestUnavailable {
+        unavailable: crate::config::cloudflare_speed_test::CloudflareSpeedTestUnavailable,
+    },
     #[cfg(target_os = "linux")]
     ThemeChanged {
         theme: tauri::Theme,
@@ -379,6 +385,25 @@ fn sample_frontend_events(uid: &String) -> Vec<(FrontendEvent<'_>, &'static str,
         op_in_flight: false,
     }
     .to_view();
+    let cloudflare_payload = json!({
+        "schemaVersion": 1, "capability": "verge-cloudflare1", "runId": "run-1", "revision": 1,
+        "state": "completed", "stage": "complete", "interfaceName": "eth0", "dnsMode": "system",
+        "method": "verge-cfst-transfer-v3", "latencyMethod": "tcp-connect",
+        "url": "https://speed.cloudflare.com/…", "startedAt": "2026-10-19T00:00:00Z",
+        "bytesRead": 512, "budgetBytes": 268435456, "completedTargets": 1, "totalTargets": 1,
+        "results": [{
+            "ip": "8.8.8.8", "sources": ["best.cloudflare.182682.xyz"], "state": "short",
+            "meanRate": 1024.0, "peakRate": 2048.0, "score": 0.5,
+            "bytesRead": 512, "durationMs": 500, "failures": 0, "attempts": 3,
+            "successfulRounds": 1, "attemptedRounds": 2
+        }], "sources": [
+            {"name": "best.cloudflare.182682.xyz", "ips": ["8.8.8.8"], "state": "resolved", "eligibleIpv4": 1, "eligibleIpv6": 0, "truncated": false},
+            {"name": "saas.sin.fan", "ips": [], "state": "failed", "eligibleIpv4": 0, "eligibleIpv6": 0, "truncated": false},
+            {"name": "best.cloudflare.19931110.xyz", "ips": [], "state": "failed", "eligibleIpv4": 0, "eligibleIpv6": 0, "truncated": false}
+        ]
+    });
+    let cloudflare_snapshot = serde_json::from_value(cloudflare_payload.clone())
+        .unwrap_or_else(|error| panic!("invalid Cloudflare wire fixture: {error}"));
     vec![
         (FrontendEvent::RefreshClash, "verge://refresh-clash-config", json!(null)),
         (FrontendEvent::RefreshVerge, "verge://refresh-verge-config", json!(null)),
@@ -410,6 +435,24 @@ fn sample_frontend_events(uid: &String) -> Vec<(FrontendEvent<'_>, &'static str,
             FrontendEvent::PendingFailuresChanged,
             "verge://pending-failures-changed",
             json!(null),
+        ),
+        (
+            FrontendEvent::CloudflareSpeedTest {
+                snapshot: cloudflare_snapshot,
+            },
+            "verge://cloudflare-speed-test",
+            cloudflare_payload,
+        ),
+        (
+            FrontendEvent::CloudflareSpeedTestUnavailable {
+                unavailable: crate::config::cloudflare_speed_test::CloudflareSpeedTestUnavailable {
+                    run_id: "run-1".into(),
+                    revision: 1,
+                    reason: "disconnected".into(),
+                },
+            },
+            "verge://cloudflare-speed-test-unavailable",
+            json!({"runId": "run-1", "revision": 1, "reason": "disconnected"}),
         ),
         (
             FrontendEvent::ProfileChanged {
@@ -463,6 +506,8 @@ frontend_events! {
     profile_completed: ProfileUpdatePayload = "profile-update-completed", FrontendEvent::ProfileUpdateCompleted { uid } => ProfileUpdatePayload { uid: uid.to_string() };
     run_state: crate::core::runstate::RunStateView = "verge://run-state-changed", FrontendEvent::RunStateChanged { state } => state;
     pending_failures: () = "verge://pending-failures-changed", FrontendEvent::PendingFailuresChanged => ();
+    cloudflare_speed_test: crate::config::cloudflare_speed_test::CloudflareSnapshot = "verge://cloudflare-speed-test", FrontendEvent::CloudflareSpeedTest { snapshot } => snapshot;
+    cloudflare_speed_test_unavailable: crate::config::cloudflare_speed_test::CloudflareSpeedTestUnavailable = "verge://cloudflare-speed-test-unavailable", FrontendEvent::CloudflareSpeedTestUnavailable { unavailable } => unavailable;
 }
 
 #[derive(serde::Serialize, specta::Type)]

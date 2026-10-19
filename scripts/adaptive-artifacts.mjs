@@ -111,13 +111,13 @@ if (windows) {
     throw new Error('Packaging changed the custom core payload')
 }
 const version = run(stable, ['-v']).trim()
-if (!version.includes('v1.19.32-verge-adaptive1'))
+if (!version.split(/\s+/).includes(metadata.version))
   throw new Error(`Wrong packaged version: ${version}`)
 mkdirSync(artifactOutput, { recursive: true })
 if (appOnly) {
   const archive = join(
     artifactOutput,
-    'Clash.Verge_2.5.9_arm64_Adaptive.app.zip',
+    'Clash.Verge_2.5.9_arm64_CloudflareMeasured.app.zip',
   )
   run('ditto', [
     '-c',

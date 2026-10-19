@@ -1,6 +1,7 @@
 import {
   Button,
   Dialog,
+  type DialogProps,
   DialogActions,
   DialogContent,
   DialogTitle,
@@ -19,6 +20,7 @@ interface Props {
   disableCancel?: boolean
   disableFooter?: boolean
   contentSx?: SxProps<Theme>
+  maxWidth?: DialogProps['maxWidth']
   children?: ReactNode
   loading?: boolean
   onOk?: () => void
@@ -39,6 +41,7 @@ export const BaseDialog: React.FC<Props> = ({
   cancelBtn,
   disableEnforceFocus,
   contentSx,
+  maxWidth,
   disableCancel,
   disableOk,
   disableFooter,
@@ -50,6 +53,7 @@ export const BaseDialog: React.FC<Props> = ({
   return (
     <Dialog
       open={open}
+      maxWidth={maxWidth}
       onClose={onClose}
       disableEnforceFocus={disableEnforceFocus}
     >

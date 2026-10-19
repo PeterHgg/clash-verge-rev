@@ -1,6 +1,11 @@
 import { beforeEach, expect, it, vi } from 'vitest'
 
+import type {
+  CloudflareCapability_Serialize,
+  CloudflareSnapshot,
+} from '@/services/bindings'
 import {
+  getCloudflareSpeedTest,
   getPendingFailures,
   getRuntimeState,
   type RunState,
@@ -10,6 +15,7 @@ import { appStoreReducer, initialAppStoreState } from './app-state'
 import { createStoreReads } from './store-reads'
 
 vi.mock('@/services/cmds', () => ({
+  getCloudflareSpeedTest: vi.fn(),
   getRuntimeState: vi.fn(),
   getPendingFailures: vi.fn().mockResolvedValue([]),
   getSidecarFailure: vi.fn().mockResolvedValue({ revision: 0, detail: null }),
@@ -88,4 +94,32 @@ it('does not restore cleared pending failures from an older read', async () => {
   ])
   await Promise.resolve()
   expect(state.pendingFailures).toEqual([])
+})
+
+it('retains live Cloudflare state when an older empty reconnect read finishes', async () => {
+  type View = Awaited<ReturnType<typeof getCloudflareSpeedTest>>
+  let resolve!: (view: View) => void
+  vi.mocked(getCloudflareSpeedTest).mockImplementationOnce(
+    () =>
+      new Promise((r) => {
+        resolve = r
+      }),
+  )
+  let state = initialAppStoreState
+  const reads = createStoreReads((action) => {
+    state = appStoreReducer(state, action)
+  })
+  const pending = reads.readCloudflareSpeedTest()
+  const snapshot = {
+    runId: 'live',
+    revision: 2,
+    startedAt: '2026-10-19T12:00:00Z',
+  } as CloudflareSnapshot
+  reads.acceptCloudflareSnapshot(snapshot)
+  resolve({
+    capability: { supported: true } as CloudflareCapability_Serialize,
+    snapshot: null,
+  })
+  await pending
+  expect(state.cloudflareSnapshot).toBe(snapshot)
 })

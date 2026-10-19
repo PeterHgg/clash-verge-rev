@@ -33,6 +33,7 @@ export const useEventBus = (
       revalidateKeys,
       readPendingFailures,
       readRunState,
+      readCloudflareSpeedTest: () => void reads.readCloudflareSpeedTest(),
     })
 
     let disposed = false

@@ -1,0 +1,657 @@
+diff --git a/component/resolver/host.go b/component/resolver/host.go
+index 51445d2..ebc4869 100644
+--- a/component/resolver/host.go
++++ b/component/resolver/host.go
+@@ -2,6 +2,7 @@ package resolver
+ 
+ import (
+ 	"errors"
++	"fmt"
+ 	"net/netip"
+ 	"os"
+ 	"strconv"
+@@ -28,35 +29,62 @@ func NewHosts(hosts *trie.DomainTrie[HostValue]) Hosts {
+ 	}
+ }
+ 
++var ErrHostAliasCycle = errors.New("cycle in hosts domain mapping")
++
++const maxHostAliasDepth = 64
++
+ // Return the search result and whether to match the parameter `isDomain`
+ func (h *Hosts) Search(domain string, isDomain bool) (*HostValue, bool) {
++	value, matched, _ := h.SearchWithError(domain, isDomain)
++	return value, matched
++}
++
++func (h *Hosts) SearchWithError(domain string, isDomain bool) (*HostValue, bool, error) {
++	domain = strings.ToLower(strings.TrimRight(domain, "."))
+ 	if value := h.DomainTrie.Search(domain); value != nil {
+-		hostValue := value.Data()
+-		for {
+-			if isDomain && hostValue.IsDomain {
+-				return &hostValue, true
+-			} else {
+-				if node := h.DomainTrie.Search(hostValue.Domain); node != nil {
+-					hostValue = node.Data()
+-				} else {
+-					break
+-				}
++		visited := make(map[string]struct{})
++		for depth := 0; ; depth++ {
++			if _, ok := visited[domain]; ok {
++				return nil, false, ErrHostAliasCycle
++			}
++			if depth >= maxHostAliasDepth {
++				return nil, false, errors.New("hosts alias chain is too deep")
++			}
++			visited[domain] = struct{}{}
++			hostValue := value.Data()
++			if !hostValue.IsDomain || isDomain {
++				return &hostValue, isDomain == hostValue.IsDomain, nil
++			}
++			domain = strings.ToLower(strings.TrimRight(hostValue.Domain, "."))
++			value = h.DomainTrie.Search(domain)
++			if value == nil {
++				hostValue.Domain = domain
++				return &hostValue, false, nil
+ 			}
+ 		}
+-		if isDomain == hostValue.IsDomain {
+-			return &hostValue, true
+-		}
+-
+-		return &hostValue, false
+ 	}
+ 
+ 	if !isDomain && !DisableSystemHosts && UseSystemHosts {
+ 		addr, _ := hosts.LookupStaticHost(domain)
+ 		if hostValue, err := NewHostValue(addr); err == nil {
+-			return &hostValue, true
++			return &hostValue, true, nil
+ 		}
+ 	}
+-	return nil, false
++	return nil, false, nil
++}
++
++func (h *Hosts) Validate() error {
++	var validationErr error
++	h.DomainTrie.Foreach(func(domain string, value HostValue) bool {
++		if value.IsDomain {
++			if _, _, err := h.SearchWithError(value.Domain, false); err != nil {
++				validationErr = fmt.Errorf("%s: %w", domain, err)
++				return false
++			}
++		}
++		return true
++	})
++	return validationErr
+ }
+ 
+ type HostValue struct {
+@@ -107,7 +135,7 @@ func NewHostValueByIPs(ips []netip.Addr) (HostValue, error) {
+ }
+ 
+ func NewHostValueByDomain(domain string) (HostValue, error) {
+-	domain = strings.Trim(domain, ".")
++	domain = strings.ToLower(strings.Trim(domain, "."))
+ 	item := strings.Split(domain, ".")
+ 	if len(item) < 2 {
+ 		return HostValue{}, errors.New("invalid domain")
+diff --git a/component/resolver/resolver.go b/component/resolver/resolver.go
+index e87a910..ff6d723 100644
+--- a/component/resolver/resolver.go
++++ b/component/resolver/resolver.go
+@@ -57,11 +57,18 @@ type Resolver interface {
+ 
+ // LookupIPv4WithResolver same as LookupIPv4, but with a resolver
+ func LookupIPv4WithResolver(ctx context.Context, host string, r Resolver) ([]netip.Addr, error) {
+-	if node, ok := DefaultHosts.Search(host, false); ok {
+-		if addrs := utils.Filter(node.IPs, func(ip netip.Addr) bool {
+-			return ip.Is4()
+-		}); len(addrs) > 0 {
+-			return addrs, nil
++	if node, _, err := DefaultHosts.SearchWithError(host, false); err != nil {
++		return nil, err
++	} else if node != nil {
++		if node.IsDomain {
++			host = node.Domain
++		} else {
++			if addrs := utils.Filter(node.IPs, func(ip netip.Addr) bool {
++				return ip.Is4()
++			}); len(addrs) > 0 {
++				return addrs, nil
++			}
++			return nil, ErrIPVersion
+ 		}
+ 	}
+ 
+@@ -108,11 +115,18 @@ func LookupIPv6WithResolver(ctx context.Context, host string, r Resolver) ([]net
+ 		return nil, ErrIPv6Disabled
+ 	}
+ 
+-	if node, ok := DefaultHosts.Search(host, false); ok {
+-		if addrs := utils.Filter(node.IPs, func(ip netip.Addr) bool {
+-			return ip.Is6()
+-		}); len(addrs) > 0 {
+-			return addrs, nil
++	if node, _, err := DefaultHosts.SearchWithError(host, false); err != nil {
++		return nil, err
++	} else if node != nil {
++		if node.IsDomain {
++			host = node.Domain
++		} else {
++			if addrs := utils.Filter(node.IPs, func(ip netip.Addr) bool {
++				return ip.Is6()
++			}); len(addrs) > 0 {
++				return addrs, nil
++			}
++			return nil, ErrIPVersion
+ 		}
+ 	}
+ 
+@@ -153,8 +167,22 @@ func ResolveIPv6(ctx context.Context, host string) (netip.Addr, error) {
+ 
+ // LookupIPWithResolver same as LookupIP, but with a resolver
+ func LookupIPWithResolver(ctx context.Context, host string, r Resolver) ([]netip.Addr, error) {
+-	if node, ok := DefaultHosts.Search(host, false); ok {
+-		return node.IPs, nil
++	if node, _, err := DefaultHosts.SearchWithError(host, false); err != nil {
++		return nil, err
++	} else if node != nil {
++		if node.IsDomain {
++			host = node.Domain
++		} else {
++			if DisableIPv6 {
++				if addrs := utils.Filter(node.IPs, func(ip netip.Addr) bool {
++					return ip.Is4()
++				}); len(addrs) > 0 {
++					return addrs, nil
++				}
++				return nil, ErrIPVersion
++			}
++			return node.IPs, nil
++		}
+ 	}
+ 
+ 	if r != nil && r.Invalid() {
+diff --git a/config/config.go b/config/config.go
+index 707114a..0d2b630 100644
+--- a/config/config.go
++++ b/config/config.go
+@@ -1165,20 +1165,15 @@ func parseHosts(cfg *RawConfig) (*trie.DomainTrie[resolver.HostValue], error) {
+ 			if err != nil {
+ 				return nil, fmt.Errorf("%s is not a valid value", anyValue)
+ 			}
+-			if value.IsDomain {
+-				node := tree.Search(value.Domain)
+-				for node != nil && node.Data().IsDomain {
+-					if node.Data().Domain == domain {
+-						return nil, fmt.Errorf("%s, there is a cycle in domain name mapping", domain)
+-					}
+-					node = tree.Search(node.Data().Domain)
+-				}
+-			}
+ 			if err := tree.Insert(domain, value); err != nil {
+ 				log.Warnln("skip invalid hosts entry: %s", err)
+ 			}
+ 		}
+ 	}
++	hosts := resolver.NewHosts(tree)
++	if err := hosts.Validate(); err != nil {
++		return nil, err
++	}
+ 	tree.Optimize()
+ 
+ 	return tree, nil
+diff --git a/dns/middleware.go b/dns/middleware.go
+index fa6cb68..03ef97e 100644
+--- a/dns/middleware.go
++++ b/dns/middleware.go
+@@ -36,7 +36,10 @@ func withHosts(mapping *lru.LruCache[netip.Addr, string]) middleware {
+ 				rr.Target = domain + "."
+ 				resp.Answer = append([]D.RR{rr}, resp.Answer...)
+ 			}
+-			record, ok := resolver.DefaultHosts.Search(host, q.Qtype != D.TypeA && q.Qtype != D.TypeAAAA)
++			record, ok, err := resolver.DefaultHosts.SearchWithError(host, q.Qtype != D.TypeA && q.Qtype != D.TypeAAAA)
++			if err != nil {
++				return nil, err
++			}
+ 			if !ok {
+ 				if record != nil && record.IsDomain {
+ 					// replace request domain
+diff --git a/component/resolver/hosts_alias_test.go b/component/resolver/hosts_alias_test.go
+new file mode 100644
+index 0000000..34a0487
+--- /dev/null
++++ b/component/resolver/hosts_alias_test.go
+@@ -0,0 +1,214 @@
++package resolver_test
++
++import (
++	"context"
++	"crypto/tls"
++	"crypto/x509"
++	"errors"
++	"fmt"
++	"net"
++	"net/http"
++	"net/http/httptest"
++	"net/netip"
++	"reflect"
++	"testing"
++
++	"github.com/metacubex/mihomo/component/dialer"
++	"github.com/metacubex/mihomo/component/resolver"
++	"github.com/metacubex/mihomo/component/trie"
++)
++
++type aliasResolver struct {
++	resolver.Resolver
++	lookup func(context.Context, string, string) ([]netip.Addr, error)
++}
++
++func (r *aliasResolver) Invalid() bool { return true }
++func (r *aliasResolver) LookupIPv4(ctx context.Context, host string) ([]netip.Addr, error) {
++	return r.lookup(ctx, host, "4")
++}
++func (r *aliasResolver) LookupIPv6(ctx context.Context, host string) ([]netip.Addr, error) {
++	return r.lookup(ctx, host, "6")
++}
++func (r *aliasResolver) LookupIP(ctx context.Context, host string) ([]netip.Addr, error) {
++	return r.lookup(ctx, host, "ip")
++}
++
++func installHosts(t *testing.T, entries map[string]string) resolver.Hosts {
++	t.Helper()
++	previous, ipv6, systemHosts := resolver.DefaultHosts, resolver.DisableIPv6, resolver.UseSystemHosts
++	t.Cleanup(func() {
++		resolver.DefaultHosts, resolver.DisableIPv6, resolver.UseSystemHosts = previous, ipv6, systemHosts
++	})
++	tree := trie.New[resolver.HostValue]()
++	for host, target := range entries {
++		value, err := resolver.NewHostValue([]string{target})
++		if err != nil {
++			t.Fatal(err)
++		}
++		if err := tree.Insert(host, value); err != nil {
++			t.Fatal(err)
++		}
++	}
++	resolver.DefaultHosts = resolver.NewHosts(tree)
++	resolver.DisableIPv6, resolver.UseSystemHosts = false, false
++	return resolver.DefaultHosts
++}
++
++func TestHostsAliasLookupResolverAndFamily(t *testing.T) {
++	installHosts(t, map[string]string{"origin.example": "middle.example", "middle.example": "PREFERRED.EXAMPLE."})
++	oldDefault, oldSystem := resolver.DefaultResolver, resolver.SystemResolver
++	t.Cleanup(func() { resolver.DefaultResolver, resolver.SystemResolver = oldDefault, oldSystem })
++	type contextKey struct{}
++	ctx, cancel := context.WithCancel(context.WithValue(context.Background(), contextKey{}, "policy"))
++	defer cancel()
++	ip4, ip6 := netip.MustParseAddr("192.0.2.10"), netip.MustParseAddr("2001:db8::10")
++	for _, route := range []string{"selected", "default", "system"} {
++		for _, family := range []string{"4", "6", "ip"} {
++			t.Run(route+family, func(t *testing.T) {
++				calls := 0
++				want := []netip.Addr{ip4, ip6}
++				if family == "4" {
++					want = []netip.Addr{ip4}
++				} else if family == "6" {
++					want = []netip.Addr{ip6}
++				}
++				selected := &aliasResolver{lookup: func(got context.Context, host, f string) ([]netip.Addr, error) {
++					calls++
++					if got != ctx || got.Value(contextKey{}) != "policy" || host != "preferred.example" || f != family {
++						t.Errorf("resolver got context=%v host=%q family=%q", got, host, f)
++					}
++					return want, nil
++				}}
++				unexpected := &aliasResolver{lookup: func(context.Context, string, string) ([]netip.Addr, error) {
++					return nil, errors.New("wrong resolver selected")
++				}}
++				resolver.DefaultResolver, resolver.SystemResolver = unexpected, unexpected
++				var r resolver.Resolver = selected
++				if route == "default" {
++					resolver.DefaultResolver = selected
++					r = resolver.DefaultResolver
++				} else if route == "system" {
++					r, resolver.SystemResolver = nil, selected
++				}
++				lookup := resolver.LookupIPWithResolver
++				if family == "4" {
++					lookup = resolver.LookupIPv4WithResolver
++				} else if family == "6" {
++					lookup = resolver.LookupIPv6WithResolver
++				}
++				var got []netip.Addr
++				var err error
++				if route == "default" {
++					defaultLookup := resolver.LookupIP
++					if family == "4" {
++						defaultLookup = resolver.LookupIPv4
++					} else if family == "6" {
++						defaultLookup = resolver.LookupIPv6
++					}
++					got, err = defaultLookup(ctx, "origin.example")
++				} else {
++					got, err = lookup(ctx, "origin.example", r)
++				}
++				if err != nil || !reflect.DeepEqual(got, want) || calls != 1 {
++					t.Fatalf("got %v, %v, calls=%d; want %v", got, err, calls, want)
++				}
++			})
++		}
++	}
++}
++
++func TestHostsFixedAddressFamilyDoesNotFallThrough(t *testing.T) {
++	installHosts(t, map[string]string{"v4.example": "192.0.2.1", "v6.example": "2001:db8::1", "alias.example": "v4.example"})
++	r := &aliasResolver{lookup: func(context.Context, string, string) ([]netip.Addr, error) {
++		t.Error("fixed hosts binding fell through to DNS")
++		return nil, nil
++	}}
++	for _, tc := range []struct {
++		host   string
++		lookup func(context.Context, string, resolver.Resolver) ([]netip.Addr, error)
++	}{
++		{"v4.example", resolver.LookupIPv6WithResolver},
++		{"alias.example", resolver.LookupIPv6WithResolver},
++		{"v6.example", resolver.LookupIPv4WithResolver},
++	} {
++		if ips, err := tc.lookup(context.Background(), tc.host, r); !errors.Is(err, resolver.ErrIPVersion) || len(ips) != 0 {
++			t.Fatalf("%s: got %v, %v", tc.host, ips, err)
++		}
++	}
++	resolver.DisableIPv6 = true
++	if ips, err := resolver.LookupIPWithResolver(context.Background(), "v6.example", r); !errors.Is(err, resolver.ErrIPVersion) || len(ips) != 0 {
++		t.Fatalf("IPv4-only mixed lookup got %v, %v", ips, err)
++	}
++}
++
++func TestHostsAliasCyclesAndDepth(t *testing.T) {
++	for name, entries := range map[string]map[string]string{
++		"self":     {"a.example": "a.example"},
++		"multi":    {"a.example": "b.example", "b.example": "c.example", "c.example": "a.example"},
++		"case":     {"a.example": "B.EXAMPLE.", "b.example": "A.Example"},
++		"wildcard": {"*.example": "a.example"},
++		"suffix":   {"+.example": "a.example"},
++		"dot":      {".example": "a.example"},
++	} {
++		t.Run(name, func(t *testing.T) {
++			hosts := installHosts(t, entries)
++			if err := hosts.Validate(); !errors.Is(err, resolver.ErrHostAliasCycle) {
++				t.Fatalf("validation got %v", err)
++			}
++			if _, _, err := hosts.SearchWithError("A.EXAMPLE.", false); !errors.Is(err, resolver.ErrHostAliasCycle) {
++				t.Fatalf("search got %v", err)
++			}
++			if _, err := resolver.LookupIPWithResolver(context.Background(), "a.example", nil); !errors.Is(err, resolver.ErrHostAliasCycle) {
++				t.Fatalf("lookup got %v", err)
++			}
++		})
++	}
++	entries := make(map[string]string)
++	for i := 0; i < 70; i++ {
++		entries[fmt.Sprintf("n%d.example", i)] = fmt.Sprintf("n%d.example", i+1)
++	}
++	hosts := installHosts(t, entries)
++	if _, _, err := hosts.SearchWithError("n0.example", false); err == nil {
++		t.Fatal("unbounded alias chain accepted")
++	}
++}
++
++func TestHostsAliasPreservesTLSIdentity(t *testing.T) {
++	identity := make(chan [2]string, 1)
++	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		identity <- [2]string{r.TLS.ServerName, r.Host}
++		w.WriteHeader(http.StatusNoContent)
++	}))
++	defer server.Close()
++	original := server.Certificate().DNSNames[0]
++	installHosts(t, map[string]string{original: "preferred.example"})
++	roots := x509.NewCertPool()
++	roots.AddCert(server.Certificate())
++	host, port, err := net.SplitHostPort(server.Listener.Addr().String())
++	if err != nil {
++		t.Fatal(err)
++	}
++	r := &aliasResolver{lookup: func(_ context.Context, name, family string) ([]netip.Addr, error) {
++		if name != "preferred.example" || family != "4" {
++			return nil, fmt.Errorf("wrong lookup %s/%s", name, family)
++		}
++		return []netip.Addr{netip.MustParseAddr(host)}, nil
++	}}
++	transport := &http.Transport{
++		TLSClientConfig: &tls.Config{RootCAs: roots},
++		DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
++			return dialer.DialContext(ctx, "tcp4", address, dialer.WithResolver(r))
++		},
++	}
++	defer transport.CloseIdleConnections()
++	client := &http.Client{Transport: transport}
++	resp, err := client.Get("https://" + net.JoinHostPort(original, port) + "/")
++	if err != nil {
++		t.Fatal(err)
++	}
++	resp.Body.Close()
++	if got := <-identity; got != [2]string{original, net.JoinHostPort(original, port)} {
++		t.Fatalf("identity changed: %v", got)
++	}
++}
+diff --git a/config/hosts_alias_test.go b/config/hosts_alias_test.go
+new file mode 100644
+index 0000000..f51a776
+--- /dev/null
++++ b/config/hosts_alias_test.go
+@@ -0,0 +1,45 @@
++package config
++
++import (
++	"errors"
++	"testing"
++
++	"github.com/metacubex/mihomo/component/resolver"
++)
++
++func TestParseHostsRejectsAliasCycles(t *testing.T) {
++	for name, hosts := range map[string]map[string]any{
++		"self":     {"a.example": "a.example"},
++		"multi":    {"a.example": "b.example", "b.example": "c.example", "c.example": "a.example"},
++		"case":     {"a.example": "B.EXAMPLE.", "b.example": "A.Example"},
++		"wildcard": {"*.example": "a.example"},
++		"suffix":   {"+.example": "a.example"},
++		"dot":      {".example": "a.example"},
++	} {
++		t.Run(name, func(t *testing.T) {
++			if _, err := parseHosts(&RawConfig{Hosts: hosts}); !errors.Is(err, resolver.ErrHostAliasCycle) {
++				t.Fatalf("got %v", err)
++			}
++		})
++	}
++}
++
++func TestParseHostsAcceptsTerminalAliasAndWildcardOverride(t *testing.T) {
++	tree, err := parseHosts(&RawConfig{Hosts: map[string]any{
++		"origin.example":     "PREFERRED.EXAMPLE.",
++		"*.fixed.example":    "node.fixed.example",
++		"node.fixed.example": "192.0.2.1",
++	}})
++	if err != nil {
++		t.Fatal(err)
++	}
++	hosts := resolver.NewHosts(tree)
++	value, matched := hosts.Search("origin.example", false)
++	if matched || value == nil || !value.IsDomain || value.Domain != "preferred.example" {
++		t.Fatalf("terminal alias got %v, %v", value, matched)
++	}
++	value, matched = hosts.Search("other.fixed.example", false)
++	if !matched || value == nil || value.IsDomain || value.IPs[0].String() != "192.0.2.1" {
++		t.Fatalf("wildcard override got %v, %v", value, matched)
++	}
++}
+diff --git a/dns/hosts_alias_test.go b/dns/hosts_alias_test.go
+new file mode 100644
+index 0000000..acb7252
+--- /dev/null
++++ b/dns/hosts_alias_test.go
+@@ -0,0 +1,157 @@
++package dns
++
++import (
++	"context"
++	"errors"
++	"net/netip"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	"github.com/metacubex/mihomo/component/resolver"
++	"github.com/metacubex/mihomo/component/trie"
++	icontext "github.com/metacubex/mihomo/context"
++	D "github.com/miekg/dns"
++)
++
++type hostsAliasClient struct {
++	exchange func(context.Context, *D.Msg) (*D.Msg, error)
++}
++
++func (c hostsAliasClient) Address() string  { return "fixture" }
++func (c hostsAliasClient) ResetConnection() {}
++func (c hostsAliasClient) ExchangeContext(ctx context.Context, m *D.Msg) (*D.Msg, error) {
++	return c.exchange(ctx, m)
++}
++
++func setAliasHosts(t *testing.T, entries map[string]string) {
++	t.Helper()
++	old, ipv6, systemHosts := resolver.DefaultHosts, resolver.DisableIPv6, resolver.UseSystemHosts
++	t.Cleanup(func() {
++		resolver.DefaultHosts, resolver.DisableIPv6, resolver.UseSystemHosts = old, ipv6, systemHosts
++	})
++	tree := trie.New[resolver.HostValue]()
++	for host, target := range entries {
++		value, err := resolver.NewHostValue([]string{target})
++		if err != nil {
++			t.Fatal(err)
++		}
++		if err := tree.Insert(host, value); err != nil {
++			t.Fatal(err)
++		}
++	}
++	resolver.DefaultHosts = resolver.NewHosts(tree)
++	resolver.DisableIPv6, resolver.UseSystemHosts = false, false
++}
++
++func TestHostsMiddlewareFixedAddressFamily(t *testing.T) {
++	setAliasHosts(t, map[string]string{"v4.example": "192.0.2.1", "v6.example": "2001:db8::1"})
++	h := withHosts(nil)(func(*icontext.DNSContext, *D.Msg) (*D.Msg, error) {
++		t.Fatal("fixed binding fell through to upstream DNS")
++		return nil, nil
++	})
++	for _, tc := range []struct {
++		host    string
++		qtype   uint16
++		answers int
++	}{
++		{"v4.example.", D.TypeAAAA, 0},
++		{"v6.example.", D.TypeA, 0},
++		{"v4.example.", D.TypeA, 1},
++		{"v6.example.", D.TypeAAAA, 1},
++	} {
++		request := new(D.Msg).SetQuestion(tc.host, tc.qtype)
++		ctx := icontext.NewDNSContext(context.Background())
++		response, err := h(ctx, request)
++		if err != nil || response.Rcode != D.RcodeSuccess || !response.Authoritative || len(response.Answer) != tc.answers || ctx.Type() != icontext.DNSTypeHost {
++			t.Fatalf("%s/%d: got %v, %v", tc.host, tc.qtype, response, err)
++		}
++	}
++}
++
++func TestHostsMiddlewareAliasAndCycle(t *testing.T) {
++	setAliasHosts(t, map[string]string{"origin.example": "preferred.example"})
++	ctx := icontext.NewDNSContext(context.Background())
++	request := new(D.Msg).SetQuestion("origin.example.", D.TypeAAAA)
++	h := withHosts(nil)(func(got *icontext.DNSContext, m *D.Msg) (*D.Msg, error) {
++		if got != ctx || m.Question[0].Name != "preferred.example." || m.Question[0].Qtype != D.TypeAAAA {
++			t.Fatalf("context/question changed: %v", m)
++		}
++		return new(D.Msg).SetReply(m), nil
++	})
++	response, err := h(ctx, request)
++	if err != nil || response.Question[0] != request.Question[0] || response.Answer[0].(*D.CNAME).Target != "preferred.example." {
++		t.Fatalf("got %v, %v", response, err)
++	}
++	setAliasHosts(t, map[string]string{"*.example": "origin.example"})
++	if _, err := h(ctx, request); !errors.Is(err, resolver.ErrHostAliasCycle) {
++		t.Fatalf("cycle got %v", err)
++	}
++}
++
++func TestHostsAliasUsesResolverPolicyAndCacheRefresh(t *testing.T) {
++	setAliasHosts(t, map[string]string{"origin.example": "preferred.example"})
++	var version, queries atomic.Int32
++	version.Store(1)
++	upstream := hostsAliasClient{exchange: func(_ context.Context, request *D.Msg) (*D.Msg, error) {
++		queries.Add(1)
++		q := request.Question[0]
++		if q.Name != "preferred.example." || q.Qtype != D.TypeA {
++			return nil, errors.New("wrong terminal query")
++		}
++		response := new(D.Msg).SetReply(request)
++		ip := netip.AddrFrom4([4]byte{192, 0, 2, byte(version.Load())})
++		response.Answer = []D.RR{&D.A{Hdr: D.RR_Header{Name: q.Name, Rrtype: D.TypeA, Class: D.ClassINET, Ttl: 60}, A: ip.AsSlice()}}
++		return response, nil
++	}}
++	policy := trie.New[[]dnsClient]()
++	if err := policy.Insert("preferred.example", []dnsClient{upstream}); err != nil {
++		t.Fatal(err)
++	}
++	r := &Resolver{
++		cache:  Config{}.newCache(),
++		policy: []dnsPolicy{domainTriePolicy{policy}},
++		main: []dnsClient{hostsAliasClient{exchange: func(context.Context, *D.Msg) (*D.Msg, error) {
++			return nil, errors.New("terminal policy was not preserved")
++		}}},
++	}
++	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
++	defer cancel()
++	lookup := func() netip.Addr {
++		t.Helper()
++		ips, err := resolver.LookupIPv4WithResolver(ctx, "origin.example", r)
++		if err != nil || len(ips) != 1 {
++			t.Fatalf("lookup got %v, %v", ips, err)
++		}
++		return ips[0]
++	}
++	first, second := netip.MustParseAddr("192.0.2.1"), netip.MustParseAddr("192.0.2.2")
++	if ip := lookup(); ip != first {
++		t.Fatalf("initial IP %v", ip)
++	}
++	version.Store(2)
++	if ip := lookup(); ip != first || queries.Load() != 1 {
++		t.Fatalf("valid cache not retained: %v, queries=%d", ip, queries.Load())
++	}
++	q := new(D.Msg).SetQuestion("preferred.example.", D.TypeA).Question[0]
++	cached, _, hit := r.cache.GetWithExpire(q.String())
++	if !hit {
++		t.Fatal("terminal-domain response was not cached")
++	}
++	r.cache.SetWithExpire(q.String(), cached, time.Now().Add(-time.Second))
++	if ip := lookup(); ip != first {
++		t.Fatalf("expected existing stale-while-refresh response, got %v", ip)
++	}
++	ticker := time.NewTicker(time.Millisecond)
++	defer ticker.Stop()
++	for {
++		if ip := lookup(); ip == second {
++			return
++		}
++		select {
++		case <-ctx.Done():
++			t.Fatal("terminal alias did not follow cache refresh")
++		case <-ticker.C:
++		}
++	}
++}

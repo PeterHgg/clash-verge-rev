@@ -22,7 +22,8 @@
       "fields": {
         "autoLaunch": "Inicio automático",
         "silentStart": "Inicio silencioso",
-        "loadBalanceEnhanced": "Balanceo de carga mejorado"
+        "loadBalanceEnhanced": "Balanceo de carga mejorado",
+        "cloudflareSpeedTest": "Prueba de velocidad Cloudflare y enlaces DNS"
       },
       "notifications": {
         "tunMode": {
@@ -652,6 +653,118 @@
         "ipAddress": "Dirección IP",
         "macAddress": "Dirección MAC"
       }
+    },
+    "cloudflare": {
+      "title": "Prueba de velocidad Cloudflare y enlaces DNS",
+      "testTitle": "Prueba de velocidad manual",
+      "testUrl": "HTTPS download source",
+      "interface": "Physical network interface (optional)",
+      "capabilityNotice": "This core does not support retaining valid measurement rounds. Use the bundled cf5 core.",
+      "start": "Iniciar prueba estándar (256 MiB)",
+      "downloaded": "Response body downloaded:",
+      "notTested": "Sin medir",
+      "resultsTitle": "Resultados de la prueba",
+      "ipSource": "IP / source",
+      "meanMbps": "Mean (Mbps)",
+      "p90Mbps": "Peak p90 (Mbps)",
+      "latency": "Tiempo de conexión TCP (ms)",
+      "stability": "Stability",
+      "failures": "Connection failures",
+      "score": "Score / 100",
+      "state": "Measurement state",
+      "sample": "Actual bytes / duration",
+      "bindingsTitle": "Enlaces DNS manuales",
+      "sourceDomain": "Dominio del servidor proxy",
+      "target": "Destino",
+      "dynamic": "Dynamic domain",
+      "fixed": "Fixed measured IP",
+      "stale": "The profile or its sources changed. Review the current selection and apply again.",
+      "notSaved": "Applied to the running core, but saving failed. Do not assume it was rolled back.",
+      "states": {
+        "running": "Running",
+        "completed": "Completed",
+        "cancelled": "Cancelled",
+        "failed": "Failed"
+      },
+      "stages": {
+        "resolving": "Resolving sources",
+        "screening": "Checking connections",
+        "downloading": "Downloading samples",
+        "complete": "Finished"
+      },
+      "resultStates": {
+        "pending": "Pending",
+        "screened": "Connection checked only",
+        "complete": "Complete",
+        "short": "Short sample",
+        "failed": "Failed",
+        "untested": "Not downloaded"
+      },
+      "sourceStates": {
+        "pending": "Pending",
+        "resolving": "Resolving",
+        "resolved": "Resolved",
+        "ready": "Resolved",
+        "failed": "Failed",
+        "complete": "Measured",
+        "completed": "Measured",
+        "untested": "Not measured"
+      },
+      "sampleCounts": "Usable: {{success}} · Failed: {{failed}} · Not measured: {{untested}}",
+      "roundCounts": "Valid rounds: {{successfulRounds}} · Attempts: {{attemptedRounds}}",
+      "finishReasons": {
+        "eof": "Response body ended normally",
+        "quota": "Response-body allowance reached",
+        "window": "Sampling window completed"
+      },
+      "diagnostics": {
+        "httpStatus": "HTTP {{status}}",
+        "contentType": "Content: {{type}}",
+        "retryAfter": "Retry no sooner than {{seconds}} seconds; start again manually",
+        "stages": {
+          "dns": "DNS resolution",
+          "interface": "Physical interface",
+          "tcp": "TCP connection",
+          "tls": "TLS / certificate",
+          "headers": "Response headers",
+          "http": "HTTP response",
+          "content": "Response content",
+          "body": "Response body",
+          "cancel": "Cancellation"
+        },
+        "contentTypes": {
+          "binary": "Binary",
+          "plain": "Plain text",
+          "html": "HTML",
+          "json": "JSON",
+          "other": "Other",
+          "missing": "Not declared"
+        },
+        "reasons": {
+          "resolutionFailed": "This DNS lookup failed. Check DNS and retry manually.",
+          "noEligibleAddresses": "No eligible public addresses were returned.",
+          "interfaceChanged": "The physical outbound interface changed or is unavailable. Check the network before restarting.",
+          "tcpFailed": "TCP connection attempts failed for this address.",
+          "tlsFailed": "The TLS handshake or certificate verification failed. Check the download source; verification remains enabled.",
+          "setupTimeout": "The download connection or response headers timed out.",
+          "requestFailed": "The HTTPS request failed before a usable response arrived.",
+          "httpStatus": "The download source did not return HTTP 200. Check the source before retrying.",
+          "forbidden": "The download source refused this address (403). Other addresses may still work.",
+          "serverError": "The download source returned a server error. Retry later or manually choose another HTTPS source.",
+          "rateLimited": "The source rate-limited this run. Remaining requests were stopped; retry later manually. No automatic retry.",
+          "unsupportedEncoding": "The response is compressed; it cannot be used for an accurate byte measurement.",
+          "unsupportedContent": "The response is an error page or unsupported content, not a valid download sample.",
+          "bodyReadFailed": "Reading the response body failed. This is not a normal short-file ending.",
+          "noMeasuredData": "No usable post-warmup measurement. Actual bytes are shown, but no speed or score is assigned.",
+          "cancelled": "The run was cancelled. Unfinished addresses are not failed measurements.",
+          "deadlineExceeded": "The run time limit was reached. Remaining addresses were not measured.",
+          "noCandidates": "None of the three domains supplied an eligible address. No random-address fallback is used.",
+          "noCompletedResults": "No address produced two usable download measurements. Review the individual reasons."
+        }
+      },
+      "apply": "Aplicar",
+      "confirmationFailed": "The core requested confirmation again. The change was not completed; refresh and retry.",
+      "notApplied": "The binding change did not finish applying."
     }
   },
   "feedback": {

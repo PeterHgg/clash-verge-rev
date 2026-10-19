@@ -5,6 +5,7 @@ import { DialogRef, Switch, TooltipIcon } from '@/components/base'
 import ProxyControlSwitches from '@/components/shared/proxy-control-switches'
 import { useVerge } from '@/hooks/use-verge'
 
+import { CloudflareSpeedTestViewer } from './mods/cloudflare-speed-test-viewer'
 import { GuardState } from './mods/guard-state'
 import { SettingList, SettingItem } from './mods/setting-comp'
 import { SysproxyViewer } from './mods/sysproxy-viewer'
@@ -27,6 +28,7 @@ const SettingSystem = ({ onError }: Props) => {
 
   const sysproxyRef = useRef<DialogRef>(null)
   const tunRef = useRef<DialogRef>(null)
+  const cloudflareRef = useRef<DialogRef>(null)
 
   const onSwitchFormat = (
     _e: React.ChangeEvent<HTMLInputElement>,
@@ -40,6 +42,12 @@ const SettingSystem = ({ onError }: Props) => {
     <SettingList title={t('settings.sections.system.title')}>
       <SysproxyViewer ref={sysproxyRef} />
       <TunViewer ref={tunRef} />
+      <CloudflareSpeedTestViewer ref={cloudflareRef} />
+
+      <SettingItem
+        label={t('settings.sections.system.fields.cloudflareSpeedTest')}
+        onClick={() => cloudflareRef.current?.open()}
+      />
 
       <ProxyControlSwitches
         label={t('settings.sections.system.toggles.tunMode')}

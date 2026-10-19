@@ -234,7 +234,8 @@ impl Config {
     }
 
     pub(crate) async fn generate_with_profiles(profiles: &IProfiles) -> Result<()> {
-        let (mut config, exists_keys, logs, dns_override, load_balance) = enhance::enhance(profiles).await?;
+        let (mut config, exists_keys, logs, dns_override, load_balance, cloudflare_dns) =
+            enhance::enhance(profiles).await?;
 
         resolve_provider_path_conflicts(&mut config, &dirs::app_home_dir()?)?;
         sanitize_tunnels_proxy(&mut config);
@@ -247,6 +248,7 @@ impl Config {
             *d = IRuntime {
                 config: Some(config),
                 dns_override: Some(dns_override),
+                cloudflare_dns: Some(cloudflare_dns),
                 load_balance,
                 exists_keys,
                 chain_logs: logs,

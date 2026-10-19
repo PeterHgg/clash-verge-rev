@@ -24,6 +24,7 @@ export interface BusHandlerDeps {
   readPendingFailures: () => void
   /** Re-read the run-state snapshot into the store. */
   readRunState: () => void
+  readCloudflareSpeedTest: () => void
 }
 
 /**
@@ -49,7 +50,7 @@ export const createEventBus = (deps: BusHandlerDeps) => {
     }
     lastProfileId = newProfileId
     lastProfileChangeTime = now
-    deps.revalidateKeys(['getProfiles'])
+    deps.revalidateKeys(['getProfiles', 'getCloudflareDnsInventory'])
   }
 
   const handleRefreshProxyConfig = () => {
@@ -68,12 +69,14 @@ export const createEventBus = (deps: BusHandlerDeps) => {
         'getClashInfo',
         'getClashMode',
         'getRuntimeConfig',
+        'getCloudflareDnsInventory',
         'getRules',
         'getRuleProviders',
       ]),
     'verge://refresh-verge-config': () =>
       deps.revalidateKeys(['getVergeConfig', 'getSystemProxy', 'getAutoProxy']),
-    'verge://refresh-profiles': () => deps.revalidateKeys(['getProfiles']),
+    'verge://refresh-profiles': () =>
+      deps.revalidateKeys(['getProfiles', 'getCloudflareDnsInventory']),
     'verge://refresh-proxy-config': handleRefreshProxyConfig,
     'verge://notice-message': (payload) => deps.handleNotice(payload),
     'profile-changed': handleProfileChanged,
@@ -83,13 +86,17 @@ export const createEventBus = (deps: BusHandlerDeps) => {
       deps.dispatch({ type: 'profileUpdate/started', uid }),
     'profile-update-completed': ({ uid }) => {
       deps.dispatch({ type: 'profileUpdate/completed', uid })
-      deps.revalidateKeys(['getProfiles'])
+      deps.revalidateKeys(['getProfiles', 'getCloudflareDnsInventory'])
     },
     'verge://run-state-changed': (payload) => {
       deps.dispatch({ type: 'runState/loaded', runState: payload })
       // A running core resolves every failure shown before it.
       if (payload.mode !== 'NotRunning') forgetShownStartupError()
     },
+    'verge://cloudflare-speed-test-unavailable': (unavailable) =>
+      deps.dispatch({ type: 'cloudflare/unavailable', unavailable }),
+    'verge://cloudflare-speed-test': (snapshot) =>
+      deps.dispatch({ type: 'cloudflare/snapshot', snapshot }),
     'verge://pending-failures-changed': () => deps.readPendingFailures(),
     [TEST_ALL_EVENT]: () => deps.dispatch({ type: 'testAll/requested' }),
   }
@@ -98,6 +105,7 @@ export const createEventBus = (deps: BusHandlerDeps) => {
     // Run state is read after subscribing so an event racing the store's
     // initial read cannot leave a stale snapshot behind.
     deps.readRunState()
+    deps.readCloudflareSpeedTest()
     deps.revalidateKeys(['getVergeConfig'])
     deps.readPendingFailures()
     deps.handleNotice(['dns_override::auto_disabled', ''])
@@ -109,6 +117,7 @@ export const createEventBus = (deps: BusHandlerDeps) => {
   }
 
   const onWindowFocus = () => {
+    deps.readCloudflareSpeedTest()
     deps.handleNotice(['core_start::error', ''])
   }
 

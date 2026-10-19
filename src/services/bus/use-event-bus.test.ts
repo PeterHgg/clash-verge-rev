@@ -30,6 +30,9 @@ vi.mock('@/store/app-store-context', () => ({
   useAppReads: () => createStoreReads(dispatch),
 }))
 vi.mock('@/services/cmds', () => ({
+  getCloudflareSpeedTest: vi
+    .fn()
+    .mockResolvedValue({ capability: { supported: false }, snapshot: null }),
   getPendingFailures: vi.fn().mockResolvedValue([]),
   getSidecarFailure: vi.fn().mockResolvedValue({ revision: 0, detail: null }),
   getRuntimeState: vi.fn().mockResolvedValue({ mode: 'NotRunning' }),

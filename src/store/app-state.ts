@@ -1,4 +1,10 @@
 import type {
+  CloudflareSnapshot,
+  CloudflareCapability,
+  CloudflareSpeedTestUnavailable,
+} from '@/services/bindings'
+import { isNewerCloudflareSnapshot } from '@/services/cloudflare-speed-test'
+import type {
   PendingFailure,
   RunState,
   SidecarFailureSnapshot,
@@ -14,6 +20,9 @@ export interface ProfileUpdatesState {
 export interface AppStoreState {
   /** Written by `run-state-changed` events and the store's safety-net poll. */
   readonly runState: RunState | null
+  readonly cloudflareSnapshot: CloudflareSnapshot | null
+  readonly cloudflareCapability: CloudflareCapability | null
+  readonly cloudflareError: string | null
   /** Latest backend pending-failure snapshot; toasts/dialogs dedupe on sequence. */
   readonly pendingFailures: readonly PendingFailure[]
   readonly sidecarFailure: SidecarFailureSnapshot | null
@@ -24,6 +33,9 @@ export interface AppStoreState {
 
 export const initialAppStoreState: AppStoreState = {
   runState: null,
+  cloudflareSnapshot: null,
+  cloudflareCapability: null,
+  cloudflareError: null,
   pendingFailures: [],
   sidecarFailure: null,
   profileUpdates: {
@@ -35,6 +47,14 @@ export const initialAppStoreState: AppStoreState = {
 }
 
 export type AppStoreAction =
+  | { type: 'cloudflare/snapshot'; snapshot: CloudflareSnapshot }
+  | { type: 'cloudflare/cleared' }
+  | {
+      type: 'cloudflare/unavailable'
+      unavailable: CloudflareSpeedTestUnavailable
+    }
+  | { type: 'cloudflare/capability'; capability: CloudflareCapability }
+  | { type: 'cloudflare/error'; error: string }
   | { type: 'runState/loaded'; runState: RunState }
   | { type: 'pendingFailures/loaded'; failures: readonly PendingFailure[] }
   | { type: 'sidecarFailure/loaded'; snapshot: SidecarFailureSnapshot }
@@ -77,6 +97,34 @@ export function appStoreReducer(
   action: AppStoreAction,
 ): AppStoreState {
   switch (action.type) {
+    case 'cloudflare/unavailable':
+      if (
+        state.cloudflareSnapshot?.runId !== action.unavailable.runId ||
+        action.unavailable.revision < state.cloudflareSnapshot.revision
+      )
+        return state
+      return { ...state, cloudflareError: action.unavailable.reason }
+    case 'cloudflare/snapshot':
+      return isNewerCloudflareSnapshot(
+        state.cloudflareSnapshot,
+        action.snapshot,
+      )
+        ? {
+            ...state,
+            cloudflareSnapshot: action.snapshot,
+            cloudflareError: null,
+          }
+        : state
+    case 'cloudflare/cleared':
+      return { ...state, cloudflareSnapshot: null }
+    case 'cloudflare/capability':
+      return {
+        ...state,
+        cloudflareCapability: action.capability,
+        cloudflareError: null,
+      }
+    case 'cloudflare/error':
+      return { ...state, cloudflareError: action.error }
     case 'runState/loaded':
       return { ...state, runState: action.runState }
     case 'pendingFailures/loaded':

@@ -1,0 +1,892 @@
+diff --git a/component/cloudflaretest/engine.go b/component/cloudflaretest/engine.go
+index ffeb3ab..6d231b9 100644
+--- a/component/cloudflaretest/engine.go
++++ b/component/cloudflaretest/engine.go
+@@ -78,7 +78,7 @@ func (m *Manager) Start(options Options) (Snapshot, error) {
+ 		return r.LookupIPv4(ctx, host)
+ 	}
+ 	j.dial = path.dial
+-	j.snapshot = Snapshot{SchemaVersion: SchemaVersion, Capability: Capability, LatencyMethod: LatencyMethod, RunID: hex.EncodeToString(id), Revision: 1, State: "running", Stage: "resolving", InterfaceName: path.name, DNSMode: dnsMode, URL: u.Scheme + "://" + u.Host + "/…", StartedAt: time.Now().UTC().Format(time.RFC3339Nano), BudgetBytes: BudgetBytes, Results: []Result{}, Sources: []Source{}}
++	j.snapshot = Snapshot{SchemaVersion: SchemaVersion, Capability: Capability, Method: Method, LatencyMethod: LatencyMethod, RunID: hex.EncodeToString(id), Revision: 1, State: "running", Stage: "resolving", InterfaceName: path.name, DNSMode: dnsMode, URL: u.Scheme + "://" + u.Host + "/…", StartedAt: time.Now().UTC().Format(time.RFC3339Nano), BudgetBytes: BudgetBytes, Results: []Result{}, Sources: []Source{}}
+ 	for _, domain := range PreferredDomains() {
+ 		j.snapshot.Sources = append(j.snapshot.Sources, Source{Name: domain, IPs: []string{}, State: "pending"})
+ 	}
+@@ -242,7 +242,12 @@ func (j *job) run() {
+ 			defer workers.Done()
+ 			for i := range indices {
+ 				r := j.screen(results[i])
+-				j.change(func(s *Snapshot) { s.Results[i] = r; s.CompletedTargets++ })
++				j.change(func(s *Snapshot) {
++					s.Results[i] = r
++					if r.State == "failed" {
++						s.CompletedTargets++
++					}
++				})
+ 			}
+ 		}()
+ 	}
+@@ -276,25 +281,68 @@ func (j *job) run() {
+ 		s.Stage = "downloading"
+ 		s.CompletedTargets = len(results) - len(targets)
+ 	})
+-	quota := BudgetBytes / uint64(2*len(targets))
++	j.downloadTargets(screened, targets)
++}
++
++func (j *job) downloadTargets(screened []Result, targets []int) {
++	ipBudget := BudgetBytes / uint64(len(targets))
++	quota := ipBudget / 2
+ 	passes := make(map[int][]transfer)
++	used := make(map[int]uint64)
++	attempt := func(i int, allowance uint64, lastRegular bool) bool {
++		if allowance == 0 || j.ctx.Err() != nil {
++			return false
++		}
++		started := false
++		j.change(func(s *Snapshot) {
++			s.Results[i].AttemptedRounds++
++			mergeTransfers(&s.Results[i], passes[i], *screened[i].Stability)
++			score(s.Results)
++			started = true
++		})
++		if !started {
++			return false
++		}
++		measurement := j.download(netip.MustParseAddr(screened[i].IP), allowance, i)
++		used[i] += measurement.bytes
++		passes[i] = append(passes[i], measurement)
++		j.change(func(s *Snapshot) {
++			mergeTransfers(&s.Results[i], passes[i], *screened[i].Stability)
++			score(s.Results)
++			if lastRegular {
++				s.CompletedTargets++
++			}
++			if measurement.diagnostic != nil && measurement.diagnostic.Code == "rate_limited" {
++				if s.Results[i].SuccessfulRounds == 0 {
++					s.Results[i].State = "failed"
++				}
++				if !lastRegular && len(passes[i]) < 2 {
++					s.CompletedTargets++
++				}
++			}
++		})
++		if measurement.diagnostic != nil && measurement.diagnostic.Code == "rate_limited" {
++			j.stopDiagnostic("failed", measurement.diagnostic)
++			return false
++		}
++		return j.ctx.Err() == nil
++	}
+ 	for pass := 0; pass < 2; pass++ {
+ 		for offset := range targets {
+-			if j.ctx.Err() != nil {
++			i := targets[(offset+pass)%len(targets)]
++			if !attempt(i, quota, pass == 1) {
+ 				return
+ 			}
+-			i := targets[(offset+pass)%len(targets)]
+-			measurement := j.download(netip.MustParseAddr(screened[i].IP), quota, i)
+-			passes[i] = append(passes[i], measurement)
+-			j.change(func(s *Snapshot) {
+-				mergeTransfers(&s.Results[i], passes[i])
+-				if pass == 1 {
+-					s.CompletedTargets++
+-				}
+-			})
+-			if measurement.diagnostic != nil && measurement.diagnostic.Code == "rate_limited" {
+-				j.change(func(s *Snapshot) { s.Results[i].State = "failed"; score(s.Results) })
+-				j.stopDiagnostic("failed", measurement.diagnostic)
++		}
++	}
++	for _, i := range targets {
++		recoverable, rejected := false, false
++		for _, measurement := range passes[i] {
++			recoverable = recoverable || measurement.retryable
++			rejected = rejected || !measurement.retryable
++		}
++		if j.copy().Results[i].SuccessfulRounds == 0 && recoverable && !rejected && used[i] < ipBudget {
++			if !attempt(i, ipBudget-used[i], false) {
+ 				return
+ 			}
+ 		}
+diff --git a/component/cloudflaretest/engine_test.go b/component/cloudflaretest/engine_test.go
+index a50fc7d..25d4219 100644
+--- a/component/cloudflaretest/engine_test.go
++++ b/component/cloudflaretest/engine_test.go
+@@ -19,7 +19,9 @@ import (
+ 	"path/filepath"
+ 	"runtime"
+ 	"strings"
++	"sync"
+ 	"sync/atomic"
++	"syscall"
+ 	"testing"
+ 	"time"
+ 
+@@ -48,6 +50,9 @@ func TestProductionDownloadAccountsTwoHTTPSPasses(t *testing.T) {
+ 	}
+ 	const quota uint64 = 128 * 1024
+ 	var requests atomic.Int32
++	var roundRequests atomic.Int32
++	var roundMode atomic.Value
++	roundMode.Store("")
+ 	windowStopped := make(chan struct{}, 2)
+ 	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+ 		requests.Add(1)
+@@ -55,6 +60,24 @@ func TestProductionDownloadAccountsTwoHTTPSPasses(t *testing.T) {
+ 			t.Errorf("production identity changed: %s %s %s", req.Method, req.Host, req.TLS.ServerName)
+ 		}
+ 		w.Header().Set("Content-Type", "application/octet-stream")
++		if req.URL.Path == "/rounds" || req.URL.Path == "/retry" {
++			round := roundRequests.Add(1)
++			mode := roundMode.Load().(string)
++			if (mode == "fail-first" || mode == "permanent-second") && round == 1 || mode == "fail-second" && round == 2 || mode == "fail-both" {
++				w.Header().Set("Content-Length", "200000")
++			} else if mode == "permanent-second" && round == 2 {
++				w.WriteHeader(403)
++				return
++			} else if mode == "429" && round == 2 {
++				w.WriteHeader(429)
++				return
++			} else if (mode == "cancel" || mode == "deadline") && round == 2 {
++				<-req.Context().Done()
++				return
++			} else if req.URL.Path == "/retry" && round <= 4 {
++				w.Header().Set("Content-Length", "200000")
++			}
++		}
+ 		switch req.URL.Path {
+ 		case "/missing":
+ 			w.Header()["Content-Type"] = nil
+@@ -83,6 +106,8 @@ func TestProductionDownloadAccountsTwoHTTPSPasses(t *testing.T) {
+ 		case "/setup":
+ 			<-req.Context().Done()
+ 			return
++		case "/delayed-headers":
++			time.Sleep(3200 * time.Millisecond)
+ 		case "/empty":
+ 			return
+ 		case "/unexpected":
+@@ -131,7 +156,11 @@ func TestProductionDownloadAccountsTwoHTTPSPasses(t *testing.T) {
+ 			w.Write(chunk[:left])
+ 			w.(http.Flusher).Flush()
+ 			n += uint64(left)
+-			time.Sleep(2 * time.Millisecond)
++			if req.URL.Path == "/rounds" {
++				time.Sleep(20 * time.Millisecond)
++			} else {
++				time.Sleep(2 * time.Millisecond)
++			}
+ 		}
+ 	}))
+ 	defer server.Close()
+@@ -139,7 +168,9 @@ func TestProductionDownloadAccountsTwoHTTPSPasses(t *testing.T) {
+ 	newJob := func(path string) *job {
+ 		u, _ := url.Parse("https://example.com" + path + "?token=private-token")
+ 		latency, stability := 10.0, 1.0
+-		j := &job{ctx: context.Background(), url: u, allowed: map[netip.Addr]bool{candidate: true}, snapshot: Snapshot{State: "running", Results: []Result{{IP: candidate.String(), State: "screened", LatencyMs: &latency, Stability: &stability}}}}
++		ctx, cancel := context.WithCancel(context.Background())
++		t.Cleanup(cancel)
++		j := &job{ctx: ctx, cancel: cancel, url: u, allowed: map[netip.Addr]bool{candidate: true}, snapshot: Snapshot{Method: Method, State: "running", TotalTargets: 1, Results: []Result{{IP: candidate.String(), State: "screened", LatencyMs: &latency, Stability: &stability}}}}
+ 		j.dial = func(ctx context.Context, ip netip.Addr) (net.Conn, time.Duration, error) {
+ 			if ip != candidate {
+ 				t.Errorf("candidate changed: %s", ip)
+@@ -153,6 +184,7 @@ func TestProductionDownloadAccountsTwoHTTPSPasses(t *testing.T) {
+ 			j := newJob(path)
+ 			var passes []transfer
+ 			for i := 0; i < 2; i++ {
++				j.snapshot.Results[0].AttemptedRounds++
+ 				m := j.download(candidate, quota, 0)
+ 				if m.error != "" || m.measured == 0 || m.duration.Milliseconds() == 0 || !m.short {
+ 					t.Fatalf("invalid production sample: %+v", m)
+@@ -163,7 +195,7 @@ func TestProductionDownloadAccountsTwoHTTPSPasses(t *testing.T) {
+ 			if snapshot.BytesRead != passes[0].bytes+passes[1].bytes || snapshot.Results[0].BytesRead != snapshot.BytesRead {
+ 				t.Fatal("body accounting mismatch")
+ 			}
+-			mergeTransfers(&snapshot.Results[0], passes)
++			mergeTransfers(&snapshot.Results[0], passes, 1)
+ 			score(snapshot.Results)
+ 			r := snapshot.Results[0]
+ 			if r.State != "short" || r.MeanRate == nil || *r.MeanRate <= 0 || r.PeakRate == nil || *r.PeakRate <= 0 || r.Score == nil || *r.Score <= 0 || *r.Score > 1 {
+@@ -171,6 +203,107 @@ func TestProductionDownloadAccountsTwoHTTPSPasses(t *testing.T) {
+ 			}
+ 		})
+ 	}
++	for _, mode := range []string{"fail-first", "fail-second", "fail-both", "permanent-second", "success", "429", "cancel", "deadline"} {
++		t.Run("partial-"+mode, func(t *testing.T) {
++			roundMode.Store(mode)
++			roundRequests.Store(0)
++			j := newJob("/rounds")
++			var attempts atomic.Int32
++			var first Snapshot
++			originalDial := j.dial
++			j.dial = func(ctx context.Context, ip netip.Addr) (net.Conn, time.Duration, error) {
++				attempt := attempts.Add(1)
++				if attempt == 2 {
++					first = j.copy()
++					r := first.Results[0]
++					if r.AttemptedRounds != 2 {
++						t.Errorf("attempt not published before invocation: %+v", r)
++					}
++					if mode != "fail-first" && mode != "fail-both" && mode != "permanent-second" && (r.SuccessfulRounds != 1 || r.State != "short" || r.Score == nil || *r.Score <= 0) {
++						t.Errorf("first valid round not published during second: %+v", r)
++					}
++					if mode == "cancel" {
++						time.AfterFunc(50*time.Millisecond, j.stop)
++					} else if mode == "deadline" {
++						time.AfterFunc(50*time.Millisecond, func() { j.stopDiagnostic("failed", &Diagnostic{Stage: "cancel", Code: "deadline_exceeded"}) })
++					}
++				}
++				return originalDial(ctx, ip)
++			}
++			j.downloadTargets(j.copy().Results, []int{0})
++			s := j.copy()
++			r := s.Results[0]
++			expected := uint32(1)
++			if mode == "success" {
++				expected = 2
++			} else if mode == "fail-both" || mode == "permanent-second" {
++				expected = 0
++			}
++			wantAttempts := uint32(2)
++			if mode == "fail-both" {
++				wantAttempts = 3
++			}
++			if uint32(attempts.Load()) != wantAttempts || r.AttemptedRounds != wantAttempts || r.SuccessfulRounds != expected || s.CompletedTargets > s.TotalTargets {
++				t.Fatalf("wrong transfer counts/progress: %+v", s)
++			}
++			if expected == 0 {
++				if r.State != "failed" || r.DurationMs != 0 || r.MeanRate != nil || r.Score != nil {
++					t.Fatalf("failed rounds fabricated metrics: %+v", r)
++				}
++				return
++			}
++			if r.State != "short" || r.MeanRate == nil || *r.MeanRate <= 0 || r.PeakRate == nil || *r.PeakRate <= 0 || r.Score == nil || *r.Score <= 0 || *r.Score > 1 {
++				t.Fatalf("valid partial result lost: %+v", r)
++			}
++			validMeasured := uint64(expected) * (quota - 64*1024)
++			meanFromValid := float64(validMeasured) / (float64(r.DurationMs) / 1000)
++			if math.Abs(*r.MeanRate/meanFromValid-1) > .05 {
++				t.Fatalf("failed transfer duration entered denominator: %+v", r)
++			}
++			if mode == "cancel" {
++				before := s
++				j.change(func(s *Snapshot) { s.Results[0].SuccessfulRounds++; s.BytesRead++ })
++				after := j.copy()
++				if before.Revision != after.Revision || before.BytesRead != after.BytesRead || before.Results[0].SuccessfulRounds != after.Results[0].SuccessfulRounds {
++					t.Fatal("terminal result mutated")
++				}
++			}
++			if mode == "429" && (s.Diagnostic == nil || s.Diagnostic.Code != "rate_limited") {
++				t.Fatalf("429 did not stop after preserving valid round: %+v", s)
++			}
++		})
++	}
++	t.Run("retry only after both rotated regular rounds", func(t *testing.T) {
++		roundMode.Store("")
++		roundRequests.Store(0)
++		j := newJob("/retry")
++		other := netip.MustParseAddr("8.8.8.8")
++		j.allowed[other] = true
++		r := j.snapshot.Results[0]
++		r.IP = other.String()
++		j.snapshot.Results = append(j.snapshot.Results, r)
++		j.snapshot.TotalTargets = 2
++		var order []string
++		var orderMu sync.Mutex
++		originalDial := j.dial
++		j.dial = func(ctx context.Context, ip netip.Addr) (net.Conn, time.Duration, error) {
++			orderMu.Lock()
++			order = append(order, ip.String())
++			orderMu.Unlock()
++			return originalDial(ctx, candidate)
++		}
++		j.downloadTargets(j.copy().Results, []int{0, 1})
++		s := j.copy()
++		want := []string{candidate.String(), other.String(), other.String(), candidate.String(), candidate.String(), other.String()}
++		if strings.Join(order, ",") != strings.Join(want, ",") || s.CompletedTargets != 2 || s.TotalTargets != 2 {
++			t.Fatalf("unfair round/retry order or duplicate progress: %v %+v", order, s)
++		}
++		for _, result := range s.Results {
++			if result.AttemptedRounds != 3 || result.SuccessfulRounds != 1 || result.State != "short" || result.Score == nil || result.BytesRead > BudgetBytes/2 {
++				t.Fatalf("bounded retry did not recover: %+v", result)
++			}
++		}
++	})
+ 	for _, tc := range []struct {
+ 		path, code string
+ 		status     uint16
+@@ -192,8 +325,38 @@ func TestProductionDownloadAccountsTwoHTTPSPasses(t *testing.T) {
+ 			if j.copy().BytesRead != m.bytes {
+ 				t.Fatal("failed body accounting mismatch")
+ 			}
++			expectedRetryable := tc.path == "/setup" || tc.path == "/unexpected"
++			if m.retryable != expectedRetryable {
++				t.Fatalf("unsafe retry classification for %s: %+v", tc.path, m)
++			}
++			if tc.path == "/setup" {
++				j.snapshot.Results[0].AttemptedRounds = 2
++				good := transfer{measured: 100, duration: time.Second, windows: []float64{100}, short: true}
++				for _, passes := range [][]transfer{{good, m}, {m, good}} {
++					r := j.snapshot.Results[0]
++					mergeTransfers(&r, passes, 1)
++					rows := []Result{r}
++					score(rows)
++					if rows[0].SuccessfulRounds != 1 || rows[0].State != "short" || rows[0].Score == nil || *rows[0].MeanRate != 100 || rows[0].DurationMs != 1000 {
++						t.Fatalf("real setup timeout discarded valid sample: %+v", rows[0])
++					}
++				}
++			}
+ 		})
+ 	}
++	t.Run("physical preparation does not consume setup allowance", func(t *testing.T) {
++		j := newJob("/delayed-headers")
++		originalDial := j.dial
++		j.dial = func(ctx context.Context, ip netip.Addr) (net.Conn, time.Duration, error) {
++			time.Sleep(5200 * time.Millisecond)
++			return originalDial(ctx, ip)
++		}
++		start := time.Now()
++		m := j.download(candidate, quota, 0)
++		if m.error != "" || m.measured == 0 || time.Since(start) < 8*time.Second {
++			t.Fatalf("physical preparation or old header timeout consumed allowance: %+v elapsed=%v", m, time.Since(start))
++		}
++	})
+ 	t.Run("headers then full body window", func(t *testing.T) {
+ 		j := newJob("/window")
+ 		start := time.Now()
+@@ -344,7 +507,7 @@ func TestForcedCandidateHostSNIAndResponseValidation(t *testing.T) {
+ 		}
+ 		return dialer.DialContextWithIPMeasured(ctx, "tcp", netip.MustParseAddrPort(server.Listener.Addr().String()), 3*time.Second)
+ 	}}
+-	client := j.client(netip.MustParseAddr("104.16.0.1"))
++	client := j.client(netip.MustParseAddr("104.16.0.1"), nil)
+ 	transport := client.Transport.(*http.Transport)
+ 	pool := x509.NewCertPool()
+ 	pool.AddCert(server.Certificate())
+@@ -371,13 +534,22 @@ func TestForcedCandidateHostSNIAndResponseValidation(t *testing.T) {
+ 		t.Fatalf("redirect was followed: %d requests", requests.Load())
+ 	}
+ 	j.url.Path = "/body"
+-	badClient := j.client(netip.MustParseAddr("104.16.0.1"))
++	badClient := j.client(netip.MustParseAddr("104.16.0.1"), nil)
+ 	defer badClient.CloseIdleConnections()
+ 	if _, err := j.request(context.Background(), badClient); err == nil {
+ 		t.Fatal("untrusted certificate accepted")
+ 	}
+ }
+ 
++type zeroReader struct{}
++
++func (zeroReader) Read(p []byte) (int, error) {
++	for i := range p {
++		p[i] = 0
++	}
++	return len(p), nil
++}
++
+ type readerWithError struct{ remaining int }
+ 
+ func (r *readerWithError) Read(p []byte) (int, error) {
+@@ -392,6 +564,25 @@ func (r *readerWithError) Read(p []byte) (int, error) {
+ 	return n, errors.New("fixture read failure with bytes")
+ }
+ 
++func TestTransientRetryClassification(t *testing.T) {
++	for _, tc := range []struct {
++		err  error
++		want bool
++	}{
++		{&net.OpError{Op: "dial", Err: syscall.ECONNREFUSED}, true},
++		{errors.Join(errors.New("safe connect failure"), &net.OpError{Op: "dial", Err: syscall.ETIMEDOUT}), true},
++		{io.ErrUnexpectedEOF, true},
++		{&tls.CertificateVerificationError{Err: x509.UnknownAuthorityError{}}, false},
++		{x509.HostnameError{}, false},
++		{errors.New("physical interface binding failed"), false},
++		{context.Canceled, false},
++	} {
++		if got := transientError(tc.err); got != tc.want {
++			t.Errorf("retryable %T=%v, want %v", tc.err, got, tc.want)
++		}
++	}
++}
++
+ func TestBodyBudgetWarmupErrorsAndCancellation(t *testing.T) {
+ 	const quota uint64 = 131073
+ 	var accounted uint64
+@@ -416,10 +607,24 @@ func TestBodyBudgetWarmupErrorsAndCancellation(t *testing.T) {
+ 		t.Fatal("read after cancellation")
+ 	}
+ 	for targets := 1; targets <= 12; targets++ {
+-		perPass := BudgetBytes / uint64(2*targets)
+-		if perPass*uint64(2*targets) > BudgetBytes || BudgetBytes-perPass*uint64(2*targets) >= uint64(2*targets) {
++		ipBudget := BudgetBytes / uint64(targets)
++		perPass := ipBudget / 2
++		if ipBudget*uint64(targets) > BudgetBytes || 2*perPass > ipBudget {
+ 			t.Fatal("unfair quota allocation")
+ 		}
++		spent := uint64(0)
++		for _, allowance := range []uint64{perPass, perPass, ipBudget - 2*perPass} {
++			m := readTransfer(context.Background(), io.LimitReader(zeroReader{}, int64(allowance)), allowance, func(uint64) {})
++			spent += m.bytes
++		}
++		if spent != ipBudget {
++			t.Fatalf("retry borrowed or gained body quota: %d != %d", spent, ipBudget)
++		}
++	}
++	j := &job{snapshot: Snapshot{State: "cancelled", Results: []Result{{State: "short", SuccessfulRounds: 1, AttemptedRounds: 2}}}}
++	j.account(0, 100)
++	if s := j.copy(); s.BytesRead != 100 || s.Results[0].BytesRead != 100 || s.Results[0].SuccessfulRounds != 1 || s.State != "cancelled" {
++		t.Fatalf("terminal read lost accounting or reopened result: %+v", s)
+ 	}
+ }
+ 
+@@ -467,9 +672,9 @@ func TestAdequateEOFOutranksSlowerWindow(t *testing.T) {
+ 		slow.windows[i] = float64(slow.measured) / slow.duration.Seconds()
+ 	}
+ 	latency, stability := 10.0, 1.0
+-	results := []Result{{State: "screened", LatencyMs: &latency, Stability: &stability}, {State: "screened", LatencyMs: &latency, Stability: &stability}}
+-	mergeTransfers(&results[0], []transfer{fast, fast})
+-	mergeTransfers(&results[1], []transfer{slow, slow})
++	results := []Result{{State: "screened", AttemptedRounds: 2, LatencyMs: &latency, Stability: &stability}, {State: "screened", AttemptedRounds: 2, LatencyMs: &latency, Stability: &stability}}
++	mergeTransfers(&results[0], []transfer{fast, fast}, stability)
++	mergeTransfers(&results[1], []transfer{slow, slow}, stability)
+ 	score(results)
+ 	if results[0].State != "complete" || results[1].State != "complete" || results[0].FinishReason != "eof" || results[0].Score == nil || results[1].Score == nil || *results[0].Score <= *results[1].Score {
+ 		t.Fatalf("faster adequate EOF did not outrank slow full window: %+v", results)
+@@ -487,15 +692,20 @@ func TestScoringAndCancellationSnapshot(t *testing.T) {
+ 	if results[0].Score == nil || math.Abs(*results[0].Score-1) > 1e-9 || math.Abs(*results[1].Score-.5) > 1e-9 || results[2].Score != nil {
+ 		t.Fatalf("wrong weighted score %+v", results)
+ 	}
+-	r := Result{State: "screened", Stability: ptr(1)}
+-	mergeTransfers(&r, []transfer{{measured: 100, duration: time.Second, windows: []float64{100}}, {measured: 100, duration: time.Second, windows: []float64{100}, short: true}})
+-	if r.State != "short" || r.Score != nil {
++	r := Result{State: "screened", AttemptedRounds: 2, Stability: ptr(1)}
++	mergeTransfers(&r, []transfer{{measured: 100, duration: time.Second, windows: []float64{100}}, {measured: 100, duration: time.Second, windows: []float64{100}, short: true}}, 1)
++	if r.State != "short" || r.SuccessfulRounds != 2 || r.Score != nil {
+ 		t.Fatalf("short sample lost: %+v", r)
+ 	}
+-	r = Result{State: "screened"}
+-	mergeTransfers(&r, []transfer{{measured: 100, duration: time.Second, windows: []float64{100}}, {measured: 100, duration: time.Second, windows: []float64{100}, error: "body_read_failed", diagnostic: &Diagnostic{Stage: "body", Code: "body_read_failed"}}})
+-	if r.State != "failed" || r.MeanRate != nil || r.Score != nil {
+-		t.Fatal("one failed pass produced a result")
++	r = Result{State: "screened", AttemptedRounds: 2, LatencyMs: ptr(10)}
++	passes := []transfer{{measured: 100, duration: time.Second, windows: []float64{100}}, {measured: 100, duration: 7 * time.Second, windows: []float64{100}, error: "body_read_failed", diagnostic: &Diagnostic{Stage: "body", Code: "body_read_failed"}}}
++	mergeTransfers(&r, passes, 1)
++	if r.State != "short" || r.SuccessfulRounds != 1 || r.MeanRate == nil || *r.MeanRate != 100 || r.DurationMs != 1000 || r.Error != "body_read_failed" || *r.Stability != .5 {
++		t.Fatalf("one failed pass discarded valid data: %+v", r)
++	}
++	mergeTransfers(&r, passes, 1)
++	if *r.Stability != .5 {
++		t.Fatal("repeated merge compounded stability penalty")
+ 	}
+ 	ctx, cancel := context.WithCancel(context.Background())
+ 	j := &job{ctx: ctx, cancel: cancel, snapshot: Snapshot{RunID: "fixture", State: "running", Stage: "downloading", Results: []Result{}, Sources: []Source{}}}
+diff --git a/component/cloudflaretest/measure.go b/component/cloudflaretest/measure.go
+index 4b7615b..8c9d1c8 100644
+--- a/component/cloudflaretest/measure.go
++++ b/component/cloudflaretest/measure.go
+@@ -7,6 +7,7 @@ import (
+ 	"bytes"
+ 	"context"
+ 	"crypto/tls"
++	"crypto/x509"
+ 	"errors"
+ 	"io"
+ 	"math"
+@@ -18,24 +19,29 @@ import (
+ 	"sort"
+ 	"strconv"
+ 	"strings"
++	"sync"
+ 	"sync/atomic"
++	"syscall"
+ 	"time"
+ )
+ 
+ var errSetupDeadline = errors.New("setup deadline")
+ var errBodyWindow = errors.New("body window complete")
+ 
+-func (j *job) client(ip netip.Addr) *http.Client {
++func (j *job) client(ip netip.Addr, onDial func()) *http.Client {
+ 	return &http.Client{
+ 		Transport: &http.Transport{
+ 			Proxy: nil, DisableKeepAlives: true, DisableCompression: true,
+ 			TLSClientConfig:     &tls.Config{MinVersion: tls.VersionTLS12},
+-			TLSHandshakeTimeout: 3 * time.Second, ResponseHeaderTimeout: 3 * time.Second,
++			TLSHandshakeTimeout: 8 * time.Second, ResponseHeaderTimeout: 8 * time.Second,
+ 			MaxResponseHeaderBytes: 32 * 1024,
+ 			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+ 				conn, _, err := j.dialCandidate(ctx, ip)
+ 				if err != nil {
+-					return nil, &requestError{&Diagnostic{Stage: "tcp", Code: "tcp_failed"}}
++					return nil, &requestError{diagnostic: &Diagnostic{Stage: "tcp", Code: "tcp_failed"}, retryable: transientError(err)}
++				}
++				if onDial != nil {
++					onDial()
+ 				}
+ 				return conn, nil
+ 			},
+@@ -112,14 +118,32 @@ func checkResponse(response *http.Response) *Diagnostic {
+ 	return nil
+ }
+ 
+-type requestError struct{ diagnostic *Diagnostic }
++type requestError struct {
++	diagnostic *Diagnostic
++	retryable  bool
++}
+ 
+ func (e *requestError) Error() string { return e.diagnostic.Code }
+ 
++func transientError(err error) bool {
++	var certificate *tls.CertificateVerificationError
++	var unknown x509.UnknownAuthorityError
++	var hostname x509.HostnameError
++	var invalid x509.CertificateInvalidError
++	if errors.As(err, &certificate) || errors.As(err, &unknown) || errors.As(err, &hostname) || errors.As(err, &invalid) {
++		return false
++	}
++	var network net.Error
++	return errors.As(err, &network) && (network.Timeout() || network.Temporary()) ||
++		errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) ||
++		errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.ECONNREFUSED) ||
++		errors.Is(err, syscall.ECONNABORTED) || errors.Is(err, syscall.ETIMEDOUT) || errors.Is(err, syscall.EPIPE)
++}
++
+ func (j *job) request(ctx context.Context, client *http.Client) (*http.Response, error) {
+ 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, j.url.String(), nil)
+ 	if err != nil {
+-		return nil, &requestError{&Diagnostic{Stage: "headers", Code: "request_failed"}}
++		return nil, &requestError{diagnostic: &Diagnostic{Stage: "headers", Code: "request_failed"}}
+ 	}
+ 	req.Header.Set("Accept", "application/octet-stream")
+ 	req.Header.Set("Accept-Encoding", "identity")
+@@ -135,18 +159,19 @@ func (j *job) request(ctx context.Context, client *http.Client) (*http.Response,
+ 	response, err := client.Do(req)
+ 	if err != nil {
+ 		d := &Diagnostic{Stage: "headers", Code: "request_failed"}
++		retryable := transientError(err)
+ 		var dialError *requestError
+ 		if errors.As(err, &dialError) {
+-			d = dialError.diagnostic
++			d, retryable = dialError.diagnostic, dialError.retryable
+ 		}
+ 		if tlsFailed.Load() {
+ 			d.Stage, d.Code = "tls", "tls_failed"
+ 		}
+ 		if errors.Is(context.Cause(ctx), errSetupDeadline) {
+-			d.Stage, d.Code = "headers", "setup_timeout"
++			d.Stage, d.Code, retryable = "headers", "setup_timeout", true
+ 		}
+ 		if ctx.Err() != nil && !errors.Is(context.Cause(ctx), errSetupDeadline) {
+-			d.Stage, d.Code = "cancel", "cancelled"
++			d.Stage, d.Code, retryable = "cancel", "cancelled", false
+ 			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+ 				d.Code = "deadline_exceeded"
+ 			}
+@@ -155,7 +180,7 @@ func (j *job) request(ctx context.Context, client *http.Client) (*http.Response,
+ 		if ctx.Err() == nil && !tlsFailed.Load() && errors.As(err, &timeout) && timeout.Timeout() {
+ 			d.Code = "setup_timeout"
+ 		}
+-		return nil, &requestError{d}
++		return nil, &requestError{diagnostic: d, retryable: retryable}
+ 	}
+ 	return response, nil
+ }
+@@ -197,6 +222,7 @@ type transfer struct {
+ 	error        string
+ 	diagnostic   *Diagnostic
+ 	finishReason string
++	retryable    bool
+ }
+ 
+ func failedTransfer(d *Diagnostic) transfer { return transfer{error: d.Code, diagnostic: d} }
+@@ -204,17 +230,49 @@ func failedTransfer(d *Diagnostic) transfer { return transfer{error: d.Code, dia
+ func (j *job) download(ip netip.Addr, quota uint64, index int) transfer {
+ 	ctx, cancel := context.WithCancelCause(j.ctx)
+ 	defer cancel(nil)
+-	setup := time.AfterFunc(5*time.Second, func() { cancel(errSetupDeadline) })
+-	defer setup.Stop()
+-	client := j.client(ip)
++	var setupMu sync.Mutex
++	var setup *time.Timer
++	headersDone := false
++	stopSetup := func() {
++		setupMu.Lock()
++		defer setupMu.Unlock()
++		headersDone = true
++		if setup != nil {
++			setup.Stop()
++		}
++	}
++	defer stopSetup()
++	client := j.client(ip, func() {
++		setupMu.Lock()
++		defer setupMu.Unlock()
++		if headersDone || setup != nil || ctx.Err() != nil {
++			return
++		}
++		setup = time.AfterFunc(10*time.Second, func() {
++			setupMu.Lock()
++			defer setupMu.Unlock()
++			if !headersDone {
++				cancel(errSetupDeadline)
++			}
++		})
++	})
+ 	defer client.CloseIdleConnections()
+ 	response, err := j.request(ctx, client)
++	stopSetup()
+ 	if err != nil {
+-		return failedTransfer(err.(*requestError).diagnostic)
++		var request *requestError
++		if errors.As(err, &request) {
++			t := failedTransfer(request.diagnostic)
++			t.retryable = request.retryable
++			return t
++		}
++		return failedTransfer(&Diagnostic{Stage: "headers", Code: "request_failed"})
+ 	}
+ 	defer response.Body.Close()
+-	if !setup.Stop() {
+-		return failedTransfer(&Diagnostic{Stage: "headers", Code: "setup_timeout"})
++	if errors.Is(context.Cause(ctx), errSetupDeadline) {
++		t := failedTransfer(&Diagnostic{Stage: "headers", Code: "setup_timeout"})
++		t.retryable = true
++		return t
+ 	}
+ 	// Keep the original request context alive: canceling a setup child also
+ 	// cancels net/http body reads after the response headers have arrived.
+@@ -224,14 +282,19 @@ func (j *job) download(ip netip.Addr, quota uint64, index int) transfer {
+ 		return failedTransfer(d)
+ 	}
+ 	return readTransfer(ctx, response.Body, quota, func(n uint64) {
+-		j.mu.Lock()
+-		defer j.mu.Unlock()
+-		j.snapshot.BytesRead += n
+-		j.snapshot.Results[index].BytesRead += n
+-		j.snapshot.Revision++
++		j.account(index, n)
+ 	})
+ }
+ 
++func (j *job) account(index int, n uint64) {
++	j.mu.Lock()
++	defer j.mu.Unlock()
++	// Reads completing after cancellation still belong to this job's body ledger.
++	j.snapshot.BytesRead += n
++	j.snapshot.Results[index].BytesRead += n
++	j.snapshot.Revision++
++}
++
+ func badPrefix(prefix []byte) bool {
+ 	text := strings.ToLower(string(bytes.TrimSpace(prefix)))
+ 	// ASCII fill is legitimate transfer data too. Only reject page/error
+@@ -300,6 +363,7 @@ func readTransfer(ctx context.Context, body io.Reader, quota uint64, account fun
+ 				t.finishReason = "window"
+ 			} else {
+ 				t.diagnostic = &Diagnostic{Stage: "body", Code: "body_read_failed"}
++				t.retryable = transientError(err)
+ 			}
+ 			break
+ 		}
+@@ -312,6 +376,7 @@ func readTransfer(ctx context.Context, body io.Reader, quota uint64, account fun
+ 		t.diagnostic = &Diagnostic{Stage: "content", Code: "unsupported_content"}
+ 	}
+ 	if ctx.Err() != nil && !errors.Is(context.Cause(ctx), errBodyWindow) {
++		t.retryable = false
+ 		t.diagnostic = &Diagnostic{Stage: "cancel", Code: "cancelled"}
+ 		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+ 			t.diagnostic.Code = "deadline_exceeded"
+@@ -337,6 +402,9 @@ func readTransfer(ctx context.Context, body io.Reader, quota uint64, account fun
+ 		}
+ 	}
+ 	if t.diagnostic != nil {
++		if t.diagnostic.Stage == "content" {
++			t.retryable = false
++		}
+ 		t.error = t.diagnostic.Code
+ 		t.finishReason = ""
+ 	}
+@@ -344,49 +412,48 @@ func readTransfer(ctx context.Context, body io.Reader, quota uint64, account fun
+ 	return t
+ }
+ 
+-func mergeTransfers(r *Result, samples []transfer) {
++func mergeTransfers(r *Result, samples []transfer, screeningStability float64) {
+ 	var measured uint64
+ 	var duration time.Duration
+ 	var windows, means []float64
+ 	short := false
+-	valid := 0
++	valid := uint32(0)
+ 	r.Error, r.Diagnostic, r.FinishReason = "", nil, ""
+ 	r.MeanRate, r.PeakRate, r.Score = nil, nil, nil
+ 	for _, t := range samples {
+-		duration += t.duration
+ 		if t.error != "" {
+ 			r.Error, r.Diagnostic = t.error, t.diagnostic
+ 		}
+ 		if t.error == "" && t.measured > 0 && t.duration.Milliseconds() > 0 && len(t.windows) > 0 {
+ 			valid++
+ 			measured += t.measured
++			duration += t.duration
+ 			windows = append(windows, t.windows...)
+ 			means = append(means, float64(t.measured)/t.duration.Seconds())
+-			short = short || t.short
++			short = short || t.short || t.duration < 2*time.Second || len(t.windows) < 4
+ 			if r.FinishReason == "" || t.finishReason != "window" {
+ 				r.FinishReason = t.finishReason
+ 			}
+ 		}
+ 	}
++	r.SuccessfulRounds = valid
+ 	r.DurationMs = uint64(duration.Milliseconds())
+-	if len(samples) < 2 {
+-		return
+-	}
+-	if valid != 2 {
+-		r.State = "failed"
+-		r.FinishReason = ""
++	stability := screeningStability
++	if valid == 0 {
++		r.State = "screened"
++		if len(samples) >= 2 {
++			r.State = "failed"
++		}
++		r.Stability = &stability
+ 		return
+ 	}
+ 	r.State = "complete"
+-	if short {
++	if valid < 2 || short {
+ 		r.State = "short"
+ 	}
+ 	mean, peak := float64(measured)/duration.Seconds(), percentile(windows, .9)
+ 	r.MeanRate, r.PeakRate = &mean, &peak
+-	stability := 1.0
+-	if r.Stability != nil {
+-		stability = *r.Stability
+-	}
++	stability *= float64(valid) / float64(r.AttemptedRounds)
+ 	stability /= (1 + variation(windows)) * (1 + variation(means))
+ 	r.Stability = &stability
+ }
+diff --git a/component/cloudflaretest/network.go b/component/cloudflaretest/network.go
+index 60068ac..323ef63 100644
+--- a/component/cloudflaretest/network.go
++++ b/component/cloudflaretest/network.go
+@@ -208,7 +208,7 @@ func dialVerifiedIP(ctx context.Context, destination netip.AddrPort, verify func
+ 	}
+ 	conn, elapsed, err := dialer.DialContextWithIPMeasured(ctx, "tcp", destination, 3*time.Second, options()...)
+ 	if err != nil {
+-		return nil, elapsed, errors.New("candidate connection or physical interface binding failed")
++		return nil, elapsed, errors.Join(errors.New("candidate connection or physical interface binding failed"), err)
+ 	}
+ 	err = verify(ctx, conn)
+ 	if ctx.Err() != nil {
+diff --git a/component/cloudflaretest/network_timing_test.go b/component/cloudflaretest/network_timing_test.go
+index ffb9993..b5d5a45 100644
+--- a/component/cloudflaretest/network_timing_test.go
++++ b/component/cloudflaretest/network_timing_test.go
+@@ -72,6 +72,25 @@ func TestScreenUsesRealConnectDurationOutsidePhysicalMetadata(t *testing.T) {
+ 	t.Logf("screen real loopback: average connect=%vms wall=%v; not physical binding proof", *result.LatencyMs, total)
+ }
+ 
++func TestVerifiedConnectPreservesTransientCause(t *testing.T) {
++	listener, err := net.Listen("tcp4", "127.0.0.1:0")
++	if err != nil {
++		t.Fatal(err)
++	}
++	destination := netip.MustParseAddrPort(listener.Addr().String())
++	listener.Close()
++	_, _, err = dialVerifiedIP(context.Background(), destination, func(context.Context, net.Conn) error { return nil }, func() []dialer.Option { return nil })
++	var network *net.OpError
++	if err == nil || !errors.As(err, &network) || !transientError(err) {
++		t.Fatalf("connect cause lost before retry classification: %T %v", err, err)
++	}
++	rejected := errors.New("physical binding rejected")
++	_, _, err = dialVerifiedIP(context.Background(), destination, func(context.Context, net.Conn) error { return rejected }, func() []dialer.Option { return nil })
++	if !errors.Is(err, rejected) || transientError(err) {
++		t.Fatalf("binding rejection became retryable: %v", err)
++	}
++}
++
+ func TestVerifiedConnectRejectsFailuresAndParentCancellation(t *testing.T) {
+ 	for _, stage := range []string{"pre-failure", "pre-cancel", "prepare-cancel", "post-failure", "post-cancel"} {
+ 		t.Run(stage, func(t *testing.T) {
+diff --git a/component/cloudflaretest/types.go b/component/cloudflaretest/types.go
+index ecd03d9..0bc7988 100644
+--- a/component/cloudflaretest/types.go
++++ b/component/cloudflaretest/types.go
+@@ -10,8 +10,8 @@ import "errors"
+ const (
+ 	SchemaVersion         = 1
+ 	Capability            = "verge-cloudflare1"
+-	EngineVersion         = "cf-speedtest2"
+-	Method                = "verge-cfst-transfer-v2"
++	EngineVersion         = "cf-speedtest3"
++	Method                = "verge-cfst-transfer-v3"
+ 	LatencyMethod         = "tcp-connect"
+ 	UpstreamCommit        = "50b42c7f95cfb06413740ce6e1967578ebe63380"
+ 	BudgetBytes    uint64 = 256 * 1024 * 1024
+@@ -40,6 +40,7 @@ type Diagnostic struct {
+ type Snapshot struct {
+ 	SchemaVersion    int         `json:"schemaVersion"`
+ 	Capability       string      `json:"capability"`
++	Method           string      `json:"method"`
+ 	LatencyMethod    string      `json:"latencyMethod"`
+ 	RunID            string      `json:"runId"`
+ 	Revision         uint64      `json:"revision"`
+@@ -61,21 +62,23 @@ type Snapshot struct {
+ }
+ 
+ type Result struct {
+-	IP           string      `json:"ip"`
+-	Sources      []string    `json:"sources"`
+-	State        string      `json:"state"`
+-	MeanRate     *float64    `json:"meanRate,omitempty"`
+-	PeakRate     *float64    `json:"peakRate,omitempty"`
+-	LatencyMs    *float64    `json:"latencyMs,omitempty"`
+-	Stability    *float64    `json:"stability,omitempty"`
+-	Score        *float64    `json:"score,omitempty"`
+-	BytesRead    uint64      `json:"bytesRead"`
+-	DurationMs   uint64      `json:"durationMs"`
+-	Failures     uint32      `json:"failures"`
+-	Attempts     uint32      `json:"attempts"`
+-	Error        string      `json:"error,omitempty"`
+-	Diagnostic   *Diagnostic `json:"diagnostic,omitempty"`
+-	FinishReason string      `json:"finishReason,omitempty"`
++	IP               string      `json:"ip"`
++	Sources          []string    `json:"sources"`
++	State            string      `json:"state"`
++	MeanRate         *float64    `json:"meanRate,omitempty"`
++	PeakRate         *float64    `json:"peakRate,omitempty"`
++	LatencyMs        *float64    `json:"latencyMs,omitempty"`
++	Stability        *float64    `json:"stability,omitempty"`
++	Score            *float64    `json:"score,omitempty"`
++	BytesRead        uint64      `json:"bytesRead"`
++	DurationMs       uint64      `json:"durationMs"`
++	Failures         uint32      `json:"failures"`
++	Attempts         uint32      `json:"attempts"`
++	SuccessfulRounds uint32      `json:"successfulRounds"`
++	AttemptedRounds  uint32      `json:"attemptedRounds"`
++	Error            string      `json:"error,omitempty"`
++	Diagnostic       *Diagnostic `json:"diagnostic,omitempty"`
++	FinishReason     string      `json:"finishReason,omitempty"`
+ }
+ 
+ type Source struct {
+diff --git a/hub/route/cloudflare_test.go b/hub/route/cloudflare_test.go
+index 2808f52..60c8a88 100644
+--- a/hub/route/cloudflare_test.go
++++ b/hub/route/cloudflare_test.go
+@@ -32,7 +32,7 @@ func TestCloudflareRequiresNonemptySecretAndAuthentication(t *testing.T) {
+ 			if err := json.Unmarshal(w.Body.Bytes(), &capability); err != nil {
+ 				t.Fatal(err)
+ 			}
+-			if capability["schemaVersion"] != float64(1) || capability["capability"] != "verge-cloudflare1" || capability["supported"] != true || capability["engineVersion"] != "cf-speedtest2" || capability["method"] != "verge-cfst-transfer-v2" || capability["domainOnly"] != true || capability["latencyMethod"] != "tcp-connect" {
++			if capability["schemaVersion"] != float64(1) || capability["capability"] != "verge-cloudflare1" || capability["supported"] != true || capability["engineVersion"] != "cf-speedtest3" || capability["method"] != "verge-cfst-transfer-v3" || capability["domainOnly"] != true || capability["latencyMethod"] != "tcp-connect" {
+ 				t.Fatal(capability)
+ 			}
+ 		}

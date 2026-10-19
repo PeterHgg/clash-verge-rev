@@ -2,6 +2,23 @@ import { expect, it, vi } from 'vitest'
 
 import { mutate } from './mutate'
 
+it('keeps manual Cloudflare cancellation independent of a pending start intent', async () => {
+  let resolveStart!: () => void
+  const start = vi.fn(
+    () =>
+      new Promise<void>((resolve) => {
+        resolveStart = resolve
+      }),
+  )
+  expect(start).not.toHaveBeenCalled()
+  const pending = mutate(start, { id: 'cloudflare-speed-test:start' })
+  const cancel = vi.fn().mockResolvedValue(undefined)
+  await mutate(cancel, { id: 'cloudflare-speed-test:cancel:run' })
+  expect(cancel).toHaveBeenCalledOnce()
+  resolveStart()
+  await pending
+})
+
 vi.mock('@/services/notice-service', () => ({
   showNotice: { error: vi.fn(), warning: vi.fn(), success: vi.fn() },
 }))

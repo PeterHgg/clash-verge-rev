@@ -1,5 +1,6 @@
 mod backup;
 mod clash;
+pub(crate) mod cloudflare_dns;
 mod config;
 mod core_upgrade;
 mod dns;

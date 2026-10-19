@@ -22,7 +22,8 @@
       "fields": {
         "autoLaunch": "開機自啟",
         "silentStart": "靜默啟動",
-        "loadBalanceEnhanced": "負載平衡增強"
+        "loadBalanceEnhanced": "負載平衡增強",
+        "cloudflareSpeedTest": "Cloudflare 測速與 DNS 綁定"
       },
       "notifications": {
         "tunMode": {
@@ -652,6 +653,118 @@
         "ipAddress": "IP 位址",
         "macAddress": "MAC 位址"
       }
+    },
+    "cloudflare": {
+      "title": "Cloudflare 測速與 DNS 綁定",
+      "testTitle": "手動測速",
+      "testUrl": "HTTPS download source",
+      "interface": "Physical network interface (optional)",
+      "capabilityNotice": "目前核心不支援保留有效輪次的測速，請使用隨附的 cf5 核心。",
+      "start": "開始標準測速（256 MiB）",
+      "downloaded": "Response body downloaded:",
+      "notTested": "尚未測量",
+      "resultsTitle": "測速結果",
+      "ipSource": "IP / source",
+      "meanMbps": "Mean (Mbps)",
+      "p90Mbps": "Peak p90 (Mbps)",
+      "latency": "TCP 連線耗時（ms）",
+      "stability": "Stability",
+      "failures": "Connection failures",
+      "score": "Score / 100",
+      "state": "Measurement state",
+      "sample": "Actual bytes / duration",
+      "bindingsTitle": "手動 DNS 綁定",
+      "sourceDomain": "節點網域",
+      "target": "目標",
+      "dynamic": "動態網域",
+      "fixed": "Fixed measured IP",
+      "stale": "設定或其來源已變更。請檢查目前選擇後重新套用。",
+      "notSaved": "Applied to the running core, but saving failed. Do not assume it was rolled back.",
+      "states": {
+        "running": "Running",
+        "completed": "Completed",
+        "cancelled": "Cancelled",
+        "failed": "Failed"
+      },
+      "stages": {
+        "resolving": "Resolving sources",
+        "screening": "Checking connections",
+        "downloading": "Downloading samples",
+        "complete": "Finished"
+      },
+      "resultStates": {
+        "pending": "Pending",
+        "screened": "Connection checked only",
+        "complete": "Complete",
+        "short": "短時樣本",
+        "failed": "Failed",
+        "untested": "Not downloaded"
+      },
+      "sourceStates": {
+        "pending": "Pending",
+        "resolving": "Resolving",
+        "resolved": "Resolved",
+        "ready": "Resolved",
+        "failed": "Failed",
+        "complete": "Measured",
+        "completed": "Measured",
+        "untested": "Not measured"
+      },
+      "sampleCounts": "有效樣本：{{success}} · 失敗：{{failed}} · 未測量：{{untested}}",
+      "roundCounts": "有效 {{successfulRounds}} 輪 · 已測 {{attemptedRounds}} 次",
+      "finishReasons": {
+        "eof": "回應本文正常結束",
+        "quota": "已用盡回應本文額度",
+        "window": "取樣視窗結束"
+      },
+      "diagnostics": {
+        "httpStatus": "HTTP {{status}}",
+        "contentType": "內容類型：{{type}}",
+        "retryAfter": "至少等待 {{seconds}} 秒後再手動啟動",
+        "stages": {
+          "dns": "DNS 解析",
+          "interface": "實體出口網卡",
+          "tcp": "TCP 連線",
+          "tls": "TLS / 憑證",
+          "headers": "回應標頭",
+          "http": "HTTP 回應",
+          "content": "回應內容",
+          "body": "回應本文",
+          "cancel": "取消"
+        },
+        "contentTypes": {
+          "binary": "二進位",
+          "plain": "純文字",
+          "html": "HTML",
+          "json": "JSON",
+          "other": "其他",
+          "missing": "未宣告"
+        },
+        "reasons": {
+          "resolutionFailed": "本次 DNS 查詢失敗，請檢查 DNS 後手動重試。",
+          "noEligibleAddresses": "未解析到合格的公用位址。",
+          "interfaceChanged": "實體出口網卡已變更或無法使用，請檢查網路後重新啟動。",
+          "tcpFailed": "此位址的 TCP 連線嘗試失敗。",
+          "tlsFailed": "TLS 交握或憑證驗證失敗，請檢查下載來源；不會關閉憑證驗證。",
+          "setupTimeout": "建立下載連線或等候回應標頭逾時。",
+          "requestFailed": "HTTPS 請求未能取得可用回應。",
+          "httpStatus": "下載來源未回傳 HTTP 200，請檢查來源後再重試。",
+          "forbidden": "下載來源拒絕此位址（403），不代表其他位址也無法使用。",
+          "serverError": "下載來源回傳伺服器錯誤，請稍後重試或手動更換 HTTPS 來源。",
+          "rateLimited": "下載來源觸發速率限制，本輪已停止後續請求，請稍後手動重試；不會自動重試。",
+          "unsupportedEncoding": "回應經過壓縮，無法用於準確計量下載位元組。",
+          "unsupportedContent": "回應是錯誤頁或不支援的內容，不是有效下載樣本。",
+          "bodyReadFailed": "讀取回應本文失敗，不屬於短檔案的正常結束。",
+          "noMeasuredData": "沒有有效的預熱後測量，只顯示實際位元組，不產生速度或評分。",
+          "cancelled": "本輪已取消，尚未完成的位址不算測量失敗。",
+          "deadlineExceeded": "已達到整輪時限，其餘位址尚未測量。",
+          "noCandidates": "三個網域均未提供合格位址，不會回退至隨機位址。",
+          "noCompletedResults": "沒有位址取得兩輪有效下載測量，請查看各 IP 的具體原因。"
+        }
+      },
+      "apply": "套用",
+      "confirmationFailed": "核心再次要求確認，變更未完成。請重新整理後重試。",
+      "notApplied": "綁定變更未完成套用。"
     }
   },
   "feedback": {

@@ -165,6 +165,7 @@ impl CoreManager {
             *d = IRuntime {
                 config: Some(clash_config.to_owned()),
                 dns_override: None,
+                cloudflare_dns: None,
                 load_balance: None,
                 exists_keys: HashSet::new(),
                 chain_logs: Default::default(),
@@ -386,6 +387,7 @@ impl CoreManager {
 
     /// Applies a generated configuration through the active core owner.
     async fn apply_config(&self, path: PathBuf) -> Result<()> {
+        crate::core::cloudflare_speed_test::cancel_active().await;
         if matches!(*self.get_running_mode(), RunningMode::Service) {
             let _lifecycle = self.lifecycle_lock.lock().await;
             if !matches!(*self.get_running_mode(), RunningMode::Service) {

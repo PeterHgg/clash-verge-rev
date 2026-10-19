@@ -1,9 +1,12 @@
+import type { CloudflareSnapshot } from '@/services/bindings'
 import {
+  getCloudflareSpeedTest,
   getPendingFailures,
   getRuntimeState,
   getSidecarFailure,
   type RunState,
 } from '@/services/cmds'
+import { errorDetail } from '@/services/notice-service'
 
 import type { AppStoreAction } from './app-state'
 
@@ -12,6 +15,7 @@ export const createStoreReads = (
 ) => {
   let runRevision = 0
   let failureRevision = 0
+  let cloudflareRevision = 0
   let current: RunState | null = null
   let latestRead: Promise<RunState> | null = null
 
@@ -58,13 +62,39 @@ export const createStoreReads = (
       })
   }
 
+  const acceptCloudflareSnapshot = (snapshot: CloudflareSnapshot) => {
+    cloudflareRevision += 1
+    dispatch({ type: 'cloudflare/snapshot', snapshot })
+  }
+
+  const readCloudflareSpeedTest = async () => {
+    const revision = ++cloudflareRevision
+    try {
+      const view = await getCloudflareSpeedTest()
+      if (revision !== cloudflareRevision) return
+      dispatch({ type: 'cloudflare/capability', capability: view.capability })
+      if (view.snapshot) {
+        dispatch({ type: 'cloudflare/snapshot', snapshot: view.snapshot })
+      } else {
+        dispatch({ type: 'cloudflare/cleared' })
+      }
+    } catch (error) {
+      if (revision === cloudflareRevision) {
+        dispatch({ type: 'cloudflare/error', error: errorDetail(error) })
+      }
+    }
+  }
+
   return {
+    readCloudflareSpeedTest,
+    acceptCloudflareSnapshot,
     acceptRunState,
     readRunState,
     readPendingFailures,
     invalidate: () => {
       runRevision += 1
       failureRevision += 1
+      cloudflareRevision += 1
       latestRead = null
     },
   }

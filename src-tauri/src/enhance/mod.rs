@@ -1,5 +1,6 @@
 use crate::core::notify::NoticeStatus;
 mod chain;
+pub(crate) mod cloudflare_dns;
 pub mod field;
 pub mod load_balance;
 mod merge;
@@ -884,6 +885,7 @@ pub async fn enhance(
     HashMap<String, ResultLog>,
     DnsOverrideState,
     Option<load_balance::EnhancementPlan>,
+    cloudflare_dns::CloudflareDnsRuntime,
 )> {
     let profile_uid = profiles.current.as_deref().unwrap_or_default();
     let cfg_vals = get_config_values(profile_uid).await;
@@ -1000,12 +1002,29 @@ pub async fn enhance(
     } else {
         load_balance::transform(config, enable_load_balance)?
     };
+    let mut cloudflare_dns = cloudflare_dns::collect(config, profiles).await?;
+    let settings = Config::verge()
+        .await
+        .latest_arc()
+        .profile_cloudflare_dns_settings
+        .as_ref()
+        .and_then(|settings| settings.get(profile_uid))
+        .cloned()
+        .unwrap_or_default();
+    let config = cloudflare_dns::apply(&mut cloudflare_dns, &settings).await?;
     let config = use_sort(config);
 
     let mut exists_keys_set = HashSet::new();
     exists_keys_set.extend(exists_keys);
 
-    Ok((config, exists_keys_set, result_map, dns_override, load_balance))
+    Ok((
+        config,
+        exists_keys_set,
+        result_map,
+        dns_override,
+        load_balance,
+        cloudflare_dns,
+    ))
 }
 
 #[cfg(test)]

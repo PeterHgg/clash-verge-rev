@@ -1,0 +1,207 @@
+diff --git a/hub/route/server.go b/hub/route/server.go
+index aacc90e..78297ea 100644
+--- a/hub/route/server.go
++++ b/hub/route/server.go
+@@ -103,6 +103,10 @@ func SetUIPath(path string) {
+ }
+ 
+ func router(isDebug bool, secret string, dohServer string, cors Cors) *chi.Mux {
++	return routerWithCloudflareSecret(isDebug, secret, secret, dohServer, cors)
++}
++
++func routerWithCloudflareSecret(isDebug bool, secret, cloudflareSecret string, dohServer string, cors Cors) *chi.Mux {
+ 	r := chi.NewRouter()
+ 	cors.Apply(r)
+ 	if isDebug {
+@@ -125,7 +129,7 @@ func router(isDebug bool, secret string, dohServer string, cors Cors) *chi.Mux {
+ 		r.Get("/traffic", traffic)
+ 		r.Get("/memory", memory)
+ 		r.Get("/version", version)
+-		r.Mount("/verge/cloudflare-test", cloudflareRouter(secret))
++		r.Mount("/verge/cloudflare-test", cloudflareRouter(cloudflareSecret))
+ 		r.Mount("/configs", configRouter())
+ 		r.Mount("/proxies", proxyRouter())
+ 		r.Mount("/group", groupRouter())
+@@ -288,7 +292,7 @@ func startUnix(cfg *Config) {
+ 		log.Infoln("RESTful API unix listening at: %s", l.Addr().String())
+ 
+ 		server := &http.Server{
+-			Handler: router(cfg.IsDebug, "", cfg.DohServer, cfg.Cors),
++			Handler: routerWithCloudflareSecret(cfg.IsDebug, "", cfg.Secret, cfg.DohServer, cfg.Cors),
+ 		}
+ 		unixServer = server
+ 		if err = server.Serve(l); err != nil {
+@@ -319,7 +323,7 @@ func startPipe(cfg *Config) {
+ 		log.Infoln("RESTful API pipe listening at: %s", l.Addr().String())
+ 
+ 		server := &http.Server{
+-			Handler: router(cfg.IsDebug, "", cfg.DohServer, cfg.Cors),
++			Handler: routerWithCloudflareSecret(cfg.IsDebug, "", cfg.Secret, cfg.DohServer, cfg.Cors),
+ 		}
+ 		pipeServer = server
+ 		if err = server.Serve(l); err != nil {
+diff --git a/hub/route/cloudflare_local_test.go b/hub/route/cloudflare_local_test.go
+new file mode 100644
+index 0000000..ea6ee5f
+--- /dev/null
++++ b/hub/route/cloudflare_local_test.go
+@@ -0,0 +1,98 @@
++package route
++
++import (
++	"context"
++	"io"
++	"net"
++	"testing"
++	"time"
++
++	"github.com/metacubex/http"
++	"github.com/metacubex/http/httptest"
++)
++
++func testCloudflareLocalAuthentication(t *testing.T, listen func(*testing.T) (net.Listener, func(context.Context, string, string) (net.Conn, error))) {
++	t.Helper()
++	for _, secret := range []string{"local-controller-secret", ""} {
++		name := "configured-secret"
++		if secret == "" {
++			name = "blank-secret"
++		}
++		t.Run(name, func(t *testing.T) {
++			listener, dial := listen(t)
++			server := &http.Server{Handler: routerWithCloudflareSecret(false, "", secret, "", Cors{})}
++			done := make(chan error, 1)
++			go func() { done <- server.Serve(listener) }()
++			t.Cleanup(func() {
++				_ = server.Close()
++				if err := <-done; err != http.ErrServerClosed {
++					t.Errorf("serve local fixture: %v", err)
++				}
++			})
++			transport := &http.Transport{DialContext: dial}
++			t.Cleanup(transport.CloseIdleConnections)
++			client := &http.Client{Transport: transport, Timeout: 5 * time.Second}
++			wantAuthenticated := http.StatusOK
++			if secret == "" {
++				wantAuthenticated = http.StatusUnauthorized
++			}
++			for _, tc := range []struct {
++				name, path, authorization string
++				want                      int
++			}{
++				{"capability-authenticated", "/verge/cloudflare-test", "Bearer local-controller-secret", wantAuthenticated},
++				{"capability-missing", "/verge/cloudflare-test", "", http.StatusUnauthorized},
++				{"capability-wrong", "/verge/cloudflare-test", "Bearer wrong", http.StatusUnauthorized},
++				{"capability-empty-bearer", "/verge/cloudflare-test", "Bearer ", http.StatusUnauthorized},
++				{"capability-wrong-scheme", "/verge/cloudflare-test", "Basic local-controller-secret", http.StatusUnauthorized},
++				{"current-authenticated", "/verge/cloudflare-test/jobs/current", "Bearer local-controller-secret", wantAuthenticated},
++				{"current-missing", "/verge/cloudflare-test/jobs/current", "", http.StatusUnauthorized},
++				{"version-missing", "/version", "", http.StatusOK},
++				{"version-wrong", "/version", "Bearer wrong", http.StatusOK},
++			} {
++				t.Run(tc.name, func(t *testing.T) {
++					req, err := http.NewRequest(http.MethodGet, "http://local-controller"+tc.path, nil)
++					if err != nil {
++						t.Fatal(err)
++					}
++					if tc.authorization != "" {
++						req.Header.Set("Authorization", tc.authorization)
++					}
++					resp, err := client.Do(req)
++					if err != nil {
++						t.Fatal(err)
++					}
++					_, _ = io.Copy(io.Discard, resp.Body)
++					_ = resp.Body.Close()
++					if resp.StatusCode != tc.want {
++						t.Fatalf("status = %d, want %d", resp.StatusCode, tc.want)
++					}
++				})
++			}
++		})
++	}
++}
++
++func TestCloudflareOrdinaryControllerAuthentication(t *testing.T) {
++	for _, tc := range []struct {
++		name, secret, authorization string
++		want                        int
++	}{
++		{"configured-missing", "controller-secret", "", http.StatusUnauthorized},
++		{"configured-wrong", "controller-secret", "Bearer wrong", http.StatusUnauthorized},
++		{"configured-correct", "controller-secret", "Bearer controller-secret", http.StatusOK},
++		{"blank-missing", "", "", http.StatusOK},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			req := httptest.NewRequest(http.MethodGet, "http://controller/version", nil)
++			if tc.authorization != "" {
++				req.Header.Set("Authorization", tc.authorization)
++			}
++			response := httptest.NewRecorder()
++			router(false, tc.secret, "", Cors{}).ServeHTTP(response, req)
++			if response.Code != tc.want {
++				t.Fatalf("status = %d, want %d", response.Code, tc.want)
++			}
++		})
++	}
++}
+diff --git a/hub/route/cloudflare_local_unix_test.go b/hub/route/cloudflare_local_unix_test.go
+new file mode 100644
+index 0000000..5a7ea30
+--- /dev/null
++++ b/hub/route/cloudflare_local_unix_test.go
+@@ -0,0 +1,23 @@
++//go:build !windows
++
++package route
++
++import (
++	"context"
++	"net"
++	"path/filepath"
++	"testing"
++)
++
++func TestCloudflareUnixSocketAuthentication(t *testing.T) {
++	testCloudflareLocalAuthentication(t, func(t *testing.T) (net.Listener, func(context.Context, string, string) (net.Conn, error)) {
++		path := filepath.Join(t.TempDir(), "controller.sock")
++		listener, err := net.Listen("unix", path)
++		if err != nil {
++			t.Fatal(err)
++		}
++		return listener, func(ctx context.Context, _, _ string) (net.Conn, error) {
++			return (&net.Dialer{}).DialContext(ctx, "unix", path)
++		}
++	})
++}
+diff --git a/hub/route/cloudflare_local_windows_test.go b/hub/route/cloudflare_local_windows_test.go
+new file mode 100644
+index 0000000..9df77a0
+--- /dev/null
++++ b/hub/route/cloudflare_local_windows_test.go
+@@ -0,0 +1,26 @@
++//go:build windows
++
++package route
++
++import (
++	"context"
++	"net"
++	"path/filepath"
++	"testing"
++
++	"github.com/metacubex/mihomo/adapter/inbound"
++	"github.com/tailscale/go-winio"
++)
++
++func TestCloudflareNamedPipeAuthentication(t *testing.T) {
++	testCloudflareLocalAuthentication(t, func(t *testing.T) (net.Listener, func(context.Context, string, string) (net.Conn, error)) {
++		path := `\\.\pipe\mihomo-cloudflare-auth-test-` + filepath.Base(filepath.Dir(t.TempDir()))
++		listener, err := inbound.ListenNamedPipe(path)
++		if err != nil {
++			t.Fatal(err)
++		}
++		return listener, func(ctx context.Context, _, _ string) (net.Conn, error) {
++			return winio.DialPipeContext(ctx, path)
++		}
++	})
++}

@@ -22,7 +22,8 @@
       "fields": {
         "autoLaunch": "开机自启",
         "silentStart": "静默启动",
-        "loadBalanceEnhanced": "负载均衡增强"
+        "loadBalanceEnhanced": "负载均衡增强",
+        "cloudflareSpeedTest": "Cloudflare 测速与 DNS 绑定"
       },
       "notifications": {
         "tunMode": {
@@ -652,6 +653,118 @@
         "ipAddress": "IP 地址",
         "macAddress": "MAC 地址"
       }
+    },
+    "cloudflare": {
+      "title": "Cloudflare 测速与 DNS 绑定",
+      "testTitle": "手动测速",
+      "testUrl": "HTTPS 下载测速源",
+      "interface": "物理出口网卡（可选）",
+      "capabilityNotice": "当前内核不支持保留有效轮次的测速，请使用随附的 cf5 内核。",
+      "start": "开始标准测速（256 MiB）",
+      "downloaded": "已下载响应体：",
+      "notTested": "尚未测量",
+      "resultsTitle": "测速结果",
+      "ipSource": "IP / 来源",
+      "meanMbps": "平均带宽（Mbps）",
+      "p90Mbps": "峰值 p90（Mbps）",
+      "latency": "TCP 连接耗时（ms）",
+      "stability": "稳定性",
+      "failures": "连接失败率",
+      "score": "评分 / 100",
+      "state": "测量状态",
+      "sample": "实际下载量 / 时长",
+      "bindingsTitle": "手动 DNS 绑定",
+      "sourceDomain": "节点域名",
+      "target": "目标",
+      "dynamic": "动态域名",
+      "fixed": "固定测速 IP",
+      "stale": "配置或其来源已变更。请检查当前选择后重新应用。",
+      "notSaved": "已在运行内核生效，但保存失败；这不代表已回滚。",
+      "states": {
+        "running": "运行中",
+        "completed": "已完成",
+        "cancelled": "已取消",
+        "failed": "失败"
+      },
+      "stages": {
+        "resolving": "解析来源",
+        "screening": "检查连接",
+        "downloading": "下载样本",
+        "complete": "已结束"
+      },
+      "resultStates": {
+        "pending": "等待中",
+        "screened": "仅检查连接",
+        "complete": "完整",
+        "short": "短时样本",
+        "failed": "失败",
+        "untested": "未下载"
+      },
+      "sourceStates": {
+        "pending": "等待中",
+        "resolving": "解析中",
+        "resolved": "已解析",
+        "ready": "已解析",
+        "failed": "失败",
+        "complete": "已测量",
+        "completed": "已测量",
+        "untested": "未测量"
+      },
+      "sampleCounts": "有效样本：{{success}} · 失败：{{failed}} · 未测量：{{untested}}",
+      "roundCounts": "有效 {{successfulRounds}} 轮 · 已测 {{attemptedRounds}} 次",
+      "finishReasons": {
+        "eof": "响应体正常结束",
+        "quota": "已用尽响应体额度",
+        "window": "采样窗口结束"
+      },
+      "diagnostics": {
+        "httpStatus": "HTTP {{status}}",
+        "contentType": "内容类型：{{type}}",
+        "retryAfter": "至少等待 {{seconds}} 秒后再手动启动",
+        "stages": {
+          "dns": "DNS 解析",
+          "interface": "物理出口网卡",
+          "tcp": "TCP 连接",
+          "tls": "TLS / 证书",
+          "headers": "响应头",
+          "http": "HTTP 响应",
+          "content": "响应内容",
+          "body": "响应体",
+          "cancel": "取消"
+        },
+        "contentTypes": {
+          "binary": "二进制",
+          "plain": "纯文本",
+          "html": "HTML",
+          "json": "JSON",
+          "other": "其他",
+          "missing": "未声明"
+        },
+        "reasons": {
+          "resolutionFailed": "本次 DNS 查询失败，请检查 DNS 后手动重试。",
+          "noEligibleAddresses": "没有解析到合格的公网地址。",
+          "interfaceChanged": "物理出口网卡已变更或不可用，请检查网络后重新启动。",
+          "tcpFailed": "此地址的 TCP 连接尝试失败。",
+          "tlsFailed": "TLS 握手或证书校验失败，请检查下载源；不会关闭证书校验。",
+          "setupTimeout": "建立下载连接或等待响应头超时。",
+          "requestFailed": "HTTPS 请求未能取得可用响应。",
+          "httpStatus": "下载源未返回 HTTP 200，请检查下载源后再重试。",
+          "forbidden": "下载源拒绝此地址（403），不代表其他地址也不可用。",
+          "serverError": "下载源返回服务器错误，请稍后重试或手动更换 HTTPS 源。",
+          "rateLimited": "下载源触发限流，本轮已停止后续请求，请稍后手动重试；不会自动重试。",
+          "unsupportedEncoding": "响应经过压缩，无法用于准确计量下载字节。",
+          "unsupportedContent": "响应是错误页或不支持的内容，不是有效下载样本。",
+          "bodyReadFailed": "读取响应体失败，不属于短文件的正常结束。",
+          "noMeasuredData": "没有有效的预热后测量，只显示实际字节，不生成速度或评分。",
+          "cancelled": "本轮已取消，尚未完成的地址不算测量失败。",
+          "deadlineExceeded": "已达到整轮时限，剩余地址尚未测量。",
+          "noCandidates": "三个域名均未提供合格地址，不会回退到随机地址。",
+          "noCompletedResults": "没有地址取得两轮有效下载测量，请查看各 IP 的具体原因。"
+        }
+      },
+      "apply": "应用",
+      "confirmationFailed": "内核再次要求确认，变更未完成。请刷新后重试。",
+      "notApplied": "绑定变更未完成生效。"
     }
   },
   "feedback": {

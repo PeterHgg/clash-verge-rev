@@ -78,6 +78,7 @@ verge_registry! {
     enable_bypass_check => NoEffect;
     enable_dns_settings => NoEffect;
     profile_dns_settings => NoEffect;
+    profile_cloudflare_dns_settings => [ClashConfig];
     use_default_bypass => [SystemProxy];
     system_proxy_bypass => [SystemProxy];
     proxy_guard_duration => [SystemProxy];

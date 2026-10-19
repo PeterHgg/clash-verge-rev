@@ -36,7 +36,7 @@ const project = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const upstream = 'https://github.com/MetaCubeX/mihomo.git'
 const tag = 'v1.19.32'
 const commit = '88dcbf7f1614a67c3b36b848ee3592dfa92ada36'
-const version = `${tag}-verge-adaptive1`
+const version = `${tag}-verge-adaptive1-cf5`
 const toolchain = 'go1.26.8'
 const tags = ['with_gvisor']
 const patches = [
@@ -47,6 +47,30 @@ const patches = [
   {
     name: 'mihomo-adaptive.patch',
     sha256: '72cd844e5f8f44e6ea861288bfd22401a6cff6ce32cfc1d9df4c5fb16a9cd5d6',
+  },
+  {
+    name: 'mihomo-cloudflare-dns.patch',
+    sha256: 'd07b3dc16bf72d84e607defc04588e011c58765333787ca893779318644a08e5',
+  },
+  {
+    name: 'mihomo-cloudflare-test.patch',
+    sha256: '2c2837b129ba4ddf6aef042c3edbb674831ce78331fda486c2e088c1e74441e7',
+  },
+  {
+    name: 'mihomo-cloudflare-local-auth.patch',
+    sha256: 'a979d523518f0bae523895a4c93018a8ee579106fc497650c0c293b01f90cc8f',
+  },
+  {
+    name: 'mihomo-cloudflare-domain-only.patch',
+    sha256: 'd585d7a0f2bb45d9752d37ccbd88884a9478d65773d5aa0c7abba45b838f2166',
+  },
+  {
+    name: 'mihomo-cloudflare-connect-timing.patch',
+    sha256: '9fe9ae21acc143518928c6480aa0fc64960f8a51902e609999a1aba1331983d3',
+  },
+  {
+    name: 'mihomo-cloudflare-partial-results.patch',
+    sha256: '81be7b81b0116db76fe6cf1ce28d929f13d4f2f9da90bbe249864506ad5873e3',
   },
 ]
 function sha256(path) {
@@ -112,6 +136,12 @@ run(
     tags.join(','),
     './adapter/outboundgroup',
     './adapter/provider',
+    './component/cloudflaretest',
+    './component/dialer',
+    './component/resolver',
+    './config',
+    './dns',
+    './hub/route',
     './tunnel',
     '-count=1',
   ],
@@ -159,7 +189,7 @@ for (const target of selectedTargets) {
     },
   )
   if (goos === 'darwin' && hostOS === 'darwin') {
-    // Tauri preserves this identifier when it re-signs the two sidecar names.
+    // Packaging verifies the payload and seals identical signed copies afterward.
     run('codesign', [
       '--force',
       '--sign',
@@ -222,6 +252,20 @@ const metadata = {
   tags,
   goamd64: 'v2',
   cgo: false,
+  integrations: [
+    {
+      name: 'CloudflareSpeedTest',
+      upstream: 'https://github.com/XIU2/CloudflareSpeedTest',
+      commit: '50b42c7f95cfb06413740ce6e1967578ebe63380',
+      license: 'GPL-3.0',
+      capability: 'verge-cloudflare1',
+      schemaVersion: 1,
+      method: 'verge-cfst-transfer-v3',
+      domainOnly: true,
+      engineVersion: 'cf-speedtest3',
+      latencyMethod: 'tcp-connect',
+    },
+  ],
   patches,
   artifacts,
   builds,

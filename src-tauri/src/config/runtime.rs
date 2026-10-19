@@ -10,6 +10,7 @@ const PATCH_CONFIG_INNER: [&str; 5] = ["allow-lan", "ipv6", "log-level", "unifie
 pub struct IRuntime {
     pub config: Option<Mapping>,
     pub(crate) dns_override: Option<super::dns::DnsOverrideState>,
+    pub(crate) cloudflare_dns: Option<crate::enhance::cloudflare_dns::CloudflareDnsRuntime>,
     pub load_balance: Option<crate::enhance::load_balance::EnhancementPlan>,
     // Keys seen in the profile pipeline, including merge and script output.
     pub exists_keys: HashSet<String>,

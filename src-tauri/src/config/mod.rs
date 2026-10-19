@@ -1,4 +1,5 @@
 mod clash;
+pub(crate) mod cloudflare_speed_test;
 #[allow(clippy::module_inception)]
 mod config;
 pub(crate) mod dns;

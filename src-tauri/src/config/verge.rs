@@ -98,6 +98,11 @@ pub struct IVerge {
     #[specta(type = std::collections::BTreeMap<std::string::String, super::dns::ProfileDnsSettings>)]
     pub profile_dns_settings: std::collections::BTreeMap<String, super::dns::ProfileDnsSettings>,
 
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile_cloudflare_dns_settings: Option<
+        std::collections::BTreeMap<std::string::String, super::cloudflare_speed_test::ProfileCloudflareDnsSettings>,
+    >,
+
     pub use_default_bypass: Option<bool>,
     #[specta(type = Option<std::string::String>)]
     pub system_proxy_bypass: Option<String>,
@@ -488,6 +493,7 @@ impl IVerge {
         patch!(verge_http_enabled);
         patch!(enable_system_proxy);
         patch!(enable_load_balance_enhanced);
+        patch!(profile_cloudflare_dns_settings);
         patch!(enable_proxy_guard);
         patch!(enable_bypass_check);
         patch!(use_default_bypass);

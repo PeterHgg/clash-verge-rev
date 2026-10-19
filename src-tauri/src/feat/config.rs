@@ -38,6 +38,10 @@ pub(super) async fn apply_verge_patch_locked(
     patch: &IVerge,
     not_save_file: bool,
 ) -> Result<()> {
+    anyhow::ensure!(
+        patch.profile_cloudflare_dns_settings.is_none(),
+        "Cloudflare bindings must be changed through the confirmed profile binding command"
+    );
     super::executor::apply(
         _config_write,
         super::executor::Patch::Verge {

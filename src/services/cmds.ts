@@ -30,6 +30,41 @@ export type {
   UnlockItem,
 } from './bindings'
 
+export async function getCloudflareSpeedTest() {
+  return commands.getCloudflareSpeedTest()
+}
+
+export async function startCloudflareSpeedTest(
+  url: string,
+  interfaceName?: string,
+) {
+  return commands.startCloudflareSpeedTest(url, interfaceName ?? null)
+}
+
+export async function cancelCloudflareSpeedTest(runId: string) {
+  return commands.cancelCloudflareSpeedTest(runId)
+}
+
+export async function getCloudflareDnsInventory() {
+  return commands.getCloudflareDnsInventory()
+}
+
+export async function setCloudflareDnsBindings(
+  profileUid: string,
+  fingerprint: string,
+  bindings: Awaited<ReturnType<typeof getCloudflareDnsInventory>>['bindings'],
+  enabled: boolean,
+  confirmation?: string,
+) {
+  return commands.setCloudflareDnsBindings(
+    profileUid,
+    fingerprint,
+    bindings,
+    enabled,
+    confirmation ?? null,
+  )
+}
+
 export async function copyClashEnv() {
   return commands.copyClashEnv()
 }

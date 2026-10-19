@@ -757,6 +757,7 @@ impl CoreManager {
     }
 
     async fn stop_core_unprepared_inner(&self) -> Result<()> {
+        crate::core::cloudflare_speed_test::cancel_active().await;
         CLASH_LOGGER.clear_logs();
         let result = match *self.get_running_mode() {
             RunningMode::Service => self.stop_core_by_service().await,

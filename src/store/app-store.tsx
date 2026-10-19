@@ -27,6 +27,8 @@ export const AppStoreProvider = ({ children }: { children?: ReactNode }) => {
     (action: AppStoreAction) => {
       if (action.type === 'runState/loaded')
         reads.acceptRunState(action.runState)
+      else if (action.type === 'cloudflare/snapshot')
+        reads.acceptCloudflareSnapshot(action.snapshot)
       else dispatch(action)
     },
     [reads],
@@ -51,12 +53,15 @@ export const AppStoreProvider = ({ children }: { children?: ReactNode }) => {
       if (document.visibilityState !== 'visible') return
       readRunState()
       readPendingFailures()
+      void reads.readCloudflareSpeedTest()
     }
+    window.addEventListener('online', readWhenFocused)
     window.addEventListener('focus', readWhenFocused)
     document.addEventListener('visibilitychange', readWhenFocused)
     const timer = window.setInterval(pollRunState, 30000)
 
     return () => {
+      window.removeEventListener('online', readWhenFocused)
       window.removeEventListener('focus', readWhenFocused)
       document.removeEventListener('visibilitychange', readWhenFocused)
       window.clearInterval(timer)

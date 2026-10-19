@@ -1,0 +1,1733 @@
+diff --git a/component/cloudflaretest/engine.go b/component/cloudflaretest/engine.go
+index 51ad680..307cb94 100644
+--- a/component/cloudflaretest/engine.go
++++ b/component/cloudflaretest/engine.go
+@@ -31,8 +31,9 @@ type job struct {
+ 	cancel   context.CancelFunc
+ 	url      *url.URL
+ 	path     physicalPath
+-	lookup   func(context.Context, string) ([]netip.Addr, error)
++	lookup   func(context.Context, string, bool) ([]netip.Addr, error)
+ 	dial     func(context.Context, netip.Addr) (net.Conn, error)
++	allowed  map[netip.Addr]bool
+ }
+ 
+ func (m *Manager) Start(options Options) (Snapshot, error) {
+@@ -67,21 +68,18 @@ func (m *Manager) Start(options Options) (Snapshot, error) {
+ 		r = resolver.SystemResolver
+ 		dnsMode = "system-resolver-without-hosts; DNS transport follows system policy"
+ 	}
+-	j.lookup = func(ctx context.Context, host string) ([]netip.Addr, error) {
+-		if ip, err := netip.ParseAddr(host); err == nil {
+-			return []netip.Addr{ip.Unmap()}, nil
+-		}
++	j.lookup = func(ctx context.Context, host string, ipv6 bool) ([]netip.Addr, error) {
+ 		if r == nil {
+ 			return nil, errors.New("DNS resolver is unavailable")
+ 		}
+-		if path.ipv6 {
+-			return r.LookupIP(ctx, host)
++		if ipv6 {
++			return r.LookupIPv6(ctx, host)
+ 		}
+ 		return r.LookupIPv4(ctx, host)
+ 	}
+ 	j.dial = path.dial
+ 	j.snapshot = Snapshot{SchemaVersion: SchemaVersion, Capability: Capability, RunID: hex.EncodeToString(id), Revision: 1, State: "running", Stage: "resolving", InterfaceName: path.name, DNSMode: dnsMode, URL: u.Scheme + "://" + u.Host + "/…", StartedAt: time.Now().UTC().Format(time.RFC3339Nano), BudgetBytes: BudgetBytes, Results: []Result{}, Sources: []Source{}}
+-	for _, domain := range PreferredDomains {
++	for _, domain := range PreferredDomains() {
+ 		j.snapshot.Sources = append(j.snapshot.Sources, Source{Name: domain, IPs: []string{}, State: "pending"})
+ 	}
+ 	m.current, m.active = j, true
+@@ -112,7 +110,7 @@ func (m *Manager) Cancel(runID string) (Snapshot, error) {
+ 	if m.current == nil || m.current.snapshot.RunID != runID {
+ 		return Snapshot{}, ErrNotFound
+ 	}
+-	m.current.stop("cancelled", "")
++	m.current.stop()
+ 	return m.current.copy(), nil
+ }
+ 
+@@ -120,18 +118,17 @@ func (m *Manager) CancelCurrent() {
+ 	m.mu.Lock()
+ 	defer m.mu.Unlock()
+ 	if m.current != nil {
+-		m.current.stop("cancelled", "core configuration or lifecycle changed")
++		m.current.stop()
+ 	}
+ }
+ 
+ func (j *job) change(fn func(*Snapshot)) {
+ 	j.mu.Lock()
+ 	defer j.mu.Unlock()
+-	state, stage := j.snapshot.State, j.snapshot.Stage
+-	fn(&j.snapshot)
+-	if state != "running" {
+-		j.snapshot.State, j.snapshot.Stage = state, stage
++	if j.snapshot.State != "running" {
++		return
+ 	}
++	fn(&j.snapshot)
+ 	j.snapshot.Revision++
+ }
+ 
+@@ -150,12 +147,27 @@ func (j *job) copy() Snapshot {
+ 	return s
+ }
+ 
+-func (j *job) stop(state, message string) {
++func (j *job) stop() {
++	j.stopDiagnostic("cancelled", &Diagnostic{Stage: "cancel", Code: "cancelled"})
++}
++
++func (j *job) stopDiagnostic(state string, d *Diagnostic) {
+ 	j.change(func(s *Snapshot) {
+ 		if s.State != "running" {
+ 			return
+ 		}
+-		s.State, s.Stage, s.Error = state, "complete", message
++		s.State, s.Stage, s.Error, s.Diagnostic = state, "complete", d.Code, d
++		for i := range s.Sources {
++			if s.Sources[i].State == "pending" {
++				s.Sources[i].State, s.Sources[i].Error = "failed", "resolution_failed"
++				s.Sources[i].Diagnostic = &Diagnostic{Stage: "dns", Code: "resolution_failed"}
++			}
++		}
++		for i := range s.Results {
++			if s.Results[i].State == "pending" || s.Results[i].State == "screened" {
++				s.Results[i].State = "untested"
++			}
++		}
+ 		s.FinishedAt = time.Now().UTC().Format(time.RFC3339Nano)
+ 	})
+ 	j.cancel()
+@@ -174,7 +186,7 @@ func (j *job) run() {
+ 				return
+ 			case <-ticker.C:
+ 				if err := j.path.verify(j.ctx); err != nil {
+-					j.stop("failed", "physical network changed; start a new benchmark")
++					j.stopDiagnostic("failed", &Diagnostic{Stage: "interface", Code: "interface_changed"})
+ 					return
+ 				}
+ 			}
+@@ -187,7 +199,8 @@ func (j *job) run() {
+ 				s.State = "completed"
+ 				if j.ctx.Err() != nil {
+ 					s.State = "failed"
+-					s.Error = "benchmark deadline exceeded"
++					s.Error = "deadline_exceeded"
++					s.Diagnostic = &Diagnostic{Stage: "cancel", Code: "deadline_exceeded"}
+ 				}
+ 				s.Stage = "complete"
+ 				s.FinishedAt = time.Now().UTC().Format(time.RFC3339Nano)
+@@ -200,76 +213,27 @@ func (j *job) run() {
+ 			for i := range s.Sources {
+ 				if s.Sources[i].State == "pending" {
+ 					s.Sources[i].State = "failed"
+-					s.Sources[i].Error = "resolution did not complete"
++					s.Sources[i].Error = "resolution_failed"
++					s.Sources[i].Diagnostic = &Diagnostic{Stage: "dns", Code: "resolution_failed"}
+ 				}
+ 			}
+ 		})
+ 	}()
+-	ctx, cancel := context.WithTimeout(j.ctx, 5*time.Second)
+-	endpointIPs, err := j.lookup(ctx, j.url.Hostname())
+-	cancel()
+-	if err != nil || len(endpointIPs) == 0 {
+-		j.stop("failed", "test source DNS resolution failed")
++	results, sources := j.resolveCandidates()
++	if j.ctx.Err() != nil {
+ 		return
+ 	}
+-	for _, ip := range endpointIPs {
+-		if !publicIP(ip) {
+-			j.stop("failed", "test source resolved to a non-public address")
+-			return
+-		}
++	j.allowed = make(map[netip.Addr]bool, len(results))
++	for _, r := range results {
++		j.allowed[netip.MustParseAddr(r.IP)] = true
+ 	}
+-	ips, err := sampleIPs(j.path.ipv6)
+-	if err != nil {
+-		j.stop("failed", "candidate sampling failed")
++	j.change(func(s *Snapshot) {
++		s.Stage, s.Results, s.Sources, s.TotalTargets = "screening", results, sources, len(results)
++	})
++	if len(results) == 0 {
++		j.stopDiagnostic("failed", &Diagnostic{Stage: "dns", Code: "no_candidates"})
+ 		return
+ 	}
+-	results := make([]Result, 0, 70)
+-	index := make(map[string]int)
+-	add := func(ip netip.Addr, source string) {
+-		key := ip.String()
+-		if i, ok := index[key]; ok {
+-			results[i].Sources = append(results[i].Sources, source)
+-			return
+-		}
+-		index[key] = len(results)
+-		results = append(results, Result{IP: key, Sources: []string{source}, State: "pending"})
+-	}
+-	for _, ip := range ips {
+-		add(ip, "cloudflare-ranges")
+-	}
+-	for i, domain := range PreferredDomains {
+-		if j.ctx.Err() != nil {
+-			return
+-		}
+-		ctx, cancel := context.WithTimeout(j.ctx, 5*time.Second)
+-		resolved, err := j.lookup(ctx, domain)
+-		cancel()
+-		source := Source{Name: domain, IPs: []string{}, State: "resolved"}
+-		if err != nil {
+-			source.State = "failed"
+-			source.Error = "DNS resolution failed"
+-		} else {
+-			seen := make(map[netip.Addr]bool)
+-			for _, ip := range resolved {
+-				ip = ip.Unmap()
+-				if !allowedIP(ip) || (ip.Is6() && !j.path.ipv6) || seen[ip] {
+-					continue
+-				}
+-				seen[ip] = true
+-				source.IPs = append(source.IPs, ip.String())
+-				add(ip, domain)
+-				if len(source.IPs) == 2 {
+-					break
+-				}
+-			}
+-			if len(source.IPs) == 0 {
+-				source.State = "failed"
+-				source.Error = "DNS returned no eligible public Cloudflare addresses"
+-			}
+-		}
+-		j.change(func(s *Snapshot) { s.Sources[i] = source })
+-	}
+-	j.change(func(s *Snapshot) { s.Stage = "screening"; s.Results = results; s.TotalTargets = len(results) })
+ 	indices := make(chan int)
+ 	var workers sync.WaitGroup
+ 	for worker := 0; worker < 4; worker++ {
+@@ -299,42 +263,18 @@ func (j *job) run() {
+ 	}
+ 	screened := j.copy().Results
+ 	var targets []int
+-	var ranked []int
+ 	for i, r := range screened {
+ 		if r.State == "screened" {
+-			ranked = append(ranked, i)
+-		}
+-	}
+-	sort.SliceStable(ranked, func(a, b int) bool { return *screened[ranked[a]].LatencyMs < *screened[ranked[b]].LatencyMs })
+-	selected := make(map[int]bool)
+-	for _, i := range ranked {
+-		if len(targets) == 5 {
+-			break
+-		}
+-		selected[i] = true
+-		targets = append(targets, i)
+-	}
+-	for _, i := range ranked {
+-		for _, source := range screened[i].Sources {
+-			if source != "cloudflare-ranges" && !selected[i] {
+-				selected[i] = true
+-				targets = append(targets, i)
+-			}
++			targets = append(targets, i)
+ 		}
+ 	}
+ 	if len(targets) == 0 {
+-		j.stop("failed", "no candidate passed TCP and HTTPS source screening")
++		j.stopDiagnostic("failed", &Diagnostic{Stage: "tcp", Code: "tcp_failed"})
+ 		return
+ 	}
+ 	j.change(func(s *Snapshot) {
+ 		s.Stage = "downloading"
+-		s.CompletedTargets = 0
+-		s.TotalTargets = len(targets)
+-		for i := range s.Results {
+-			if s.Results[i].State == "screened" && !selected[i] {
+-				s.Results[i].State = "untested"
+-			}
+-		}
++		s.CompletedTargets = len(results) - len(targets)
+ 	})
+ 	quota := BudgetBytes / uint64(2*len(targets))
+ 	passes := make(map[int][]transfer)
+@@ -352,6 +292,11 @@ func (j *job) run() {
+ 					s.CompletedTargets++
+ 				}
+ 			})
++			if measurement.diagnostic != nil && measurement.diagnostic.Code == "rate_limited" {
++				j.change(func(s *Snapshot) { s.Results[i].State = "failed"; score(s.Results) })
++				j.stopDiagnostic("failed", measurement.diagnostic)
++				return
++			}
+ 		}
+ 	}
+ 	j.change(func(s *Snapshot) {
+@@ -361,8 +306,75 @@ func (j *job) run() {
+ 			valid = valid || r.State == "complete" || r.State == "short"
+ 		}
+ 		if !valid && s.State == "running" {
+-			s.State, s.Stage, s.Error = "failed", "complete", "no candidate completed both bandwidth passes; check individual source errors"
++			s.State, s.Stage, s.Error = "failed", "complete", "no_completed_results"
++			s.Diagnostic = &Diagnostic{Stage: "body", Code: "no_completed_results"}
+ 			s.FinishedAt = time.Now().UTC().Format(time.RFC3339Nano)
+ 		}
+ 	})
+ }
++
++func (j *job) resolveCandidates() ([]Result, []Source) {
++	results := make([]Result, 0, 12)
++	sources := make([]Source, 0, 3)
++	index := make(map[string]int)
++	for _, domain := range PreferredDomains() {
++		if j.ctx.Err() != nil {
++			break
++		}
++		source := Source{Name: domain, IPs: []string{}, State: "resolved"}
++		var resolved []netip.Addr
++		failed := false
++		for _, ipv6 := range []bool{false, true} {
++			if ipv6 && !j.path.ipv6 {
++				continue
++			}
++			ctx, cancel := context.WithTimeout(j.ctx, 5*time.Second)
++			ips, err := j.lookup(ctx, domain, ipv6)
++			cancel()
++			if err != nil {
++				failed = true
++			}
++			for _, ip := range ips {
++				if ip.Unmap().Is6() == ipv6 {
++					resolved = append(resolved, ip)
++				}
++			}
++		}
++		selected, v4, v6 := selectCandidates(resolved, j.path.ipv6)
++		source.EligibleIPv4, source.EligibleIPv6 = v4, v6
++		source.Truncated = int(v4)+int(v6) > len(selected)
++		if failed {
++			source.Error = "resolution_failed"
++			source.Diagnostic = &Diagnostic{Stage: "dns", Code: "resolution_failed"}
++		}
++		if len(selected) == 0 {
++			source.State = "failed"
++			if !failed {
++				source.Error = "no_eligible_addresses"
++				source.Diagnostic = &Diagnostic{Stage: "dns", Code: "no_eligible_addresses"}
++			}
++		}
++		for _, ip := range selected {
++			key := ip.String()
++			source.IPs = append(source.IPs, key)
++			if i, exists := index[key]; exists {
++				results[i].Sources = append(results[i].Sources, domain)
++			} else {
++				index[key] = len(results)
++				results = append(results, Result{IP: key, Sources: []string{domain}, State: "pending"})
++			}
++		}
++		sources = append(sources, source)
++	}
++	sort.Slice(results, func(i, k int) bool {
++		return netip.MustParseAddr(results[i].IP).Less(netip.MustParseAddr(results[k].IP))
++	})
++	return results, sources
++}
++
++func (j *job) dialCandidate(ctx context.Context, ip netip.Addr) (net.Conn, error) {
++	if ip.Zone() != "" || !publicIP(ip) || !j.allowed[ip] {
++		return nil, errors.New("candidate is outside this benchmark's frozen domain answers")
++	}
++	return j.dial(ctx, ip)
++}
+diff --git a/component/cloudflaretest/engine_test.go b/component/cloudflaretest/engine_test.go
+index 66a2b71..b3236c3 100644
+--- a/component/cloudflaretest/engine_test.go
++++ b/component/cloudflaretest/engine_test.go
+@@ -18,6 +18,7 @@ import (
+ 	"os/exec"
+ 	"path/filepath"
+ 	"runtime"
++	"strings"
+ 	"sync/atomic"
+ 	"testing"
+ 	"time"
+@@ -44,75 +45,272 @@ func TestProductionDownloadAccountsTwoHTTPSPasses(t *testing.T) {
+ 		return
+ 	}
+ 	const quota uint64 = 128 * 1024
++	var requests atomic.Int32
++	windowStopped := make(chan struct{}, 2)
+ 	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
++		requests.Add(1)
+ 		if req.Host != "example.com" || req.TLS.ServerName != "example.com" || req.Method != http.MethodGet {
+-			t.Errorf("production download identity changed: %s %s %s", req.Method, req.Host, req.TLS.ServerName)
++			t.Errorf("production identity changed: %s %s %s", req.Method, req.Host, req.TLS.ServerName)
+ 		}
+ 		w.Header().Set("Content-Type", "application/octet-stream")
+-		chunk := make([]byte, 32*1024)
+-		for i := 0; i < 4; i++ {
+-			w.Write(chunk)
++		switch req.URL.Path {
++		case "/missing":
++			w.Header()["Content-Type"] = nil
++		case "/plain":
++			w.Header().Set("Content-Type", "text/plain")
++		case "/identity":
++			w.Header().Set("Content-Encoding", "identity")
++		case "/html":
++			w.Header().Set("Content-Type", "text/html")
++		case "/compressed":
++			w.Header().Set("Content-Encoding", "gzip")
++		case "/status403":
++			w.WriteHeader(403)
++			return
++		case "/status429":
++			w.Header().Set("Retry-After", "999999999")
++			w.WriteHeader(429)
++			return
++		case "/status500":
++			w.WriteHeader(500)
++			return
++		case "/redirect":
++			w.Header().Set("Location", "https://127.0.0.1/secret")
++			w.WriteHeader(302)
++			return
++		case "/setup":
++			<-req.Context().Done()
++			return
++		case "/empty":
++			return
++		case "/unexpected":
++			w.Header().Set("Content-Length", "200000")
++		case "/split-html", "/split-json":
++			prefix := []string{"<h", "tml><body>challenge</body>"}
++			if req.URL.Path == "/split-json" {
++				prefix = []string{" ", "{", `"error":"private-token"}`}
++			}
++			for _, part := range prefix {
++				w.Write([]byte(part))
++				w.(http.Flusher).Flush()
++				time.Sleep(time.Millisecond)
++			}
++			return
++		case "/window":
++			defer func() { windowStopped <- struct{}{} }()
++			time.Sleep(1250 * time.Millisecond)
++		}
++		w.WriteHeader(200)
++		w.(http.Flusher).Flush()
++		chunk := bytes.Repeat([]byte("randomASCIITransferPayload0123456789"), 1024)
++		if req.URL.Path == "/window" {
++			for {
++				select {
++				case <-req.Context().Done():
++					return
++				case <-time.After(10 * time.Millisecond):
++					if _, err := w.Write(chunk); err != nil {
++						return
++					}
++					w.(http.Flusher).Flush()
++				}
++			}
++		}
++		n := uint64(0)
++		limit := quota
++		if req.URL.Path == "/eof" || req.URL.Path == "/unexpected" {
++			limit = 96 * 1024
++		}
++		for n < limit {
++			left := int(limit - n)
++			if left > len(chunk) {
++				left = len(chunk)
++			}
++			w.Write(chunk[:left])
+ 			w.(http.Flusher).Flush()
++			n += uint64(left)
+ 			time.Sleep(2 * time.Millisecond)
+ 		}
+ 	}))
+ 	defer server.Close()
+-	u, _ := url.Parse("https://example.com/download")
+-	latency, stability := 10.0, 1.0
+-	j := &job{ctx: context.Background(), url: u, snapshot: Snapshot{State: "running", Results: []Result{{IP: "104.16.0.1", State: "screened", LatencyMs: &latency, Stability: &stability}}}}
+-	j.dial = func(ctx context.Context, candidate netip.Addr) (net.Conn, error) {
+-		if candidate.String() != "104.16.0.1" {
+-			t.Errorf("candidate changed to %s", candidate)
+-		}
+-		return (&net.Dialer{}).DialContext(ctx, "tcp", server.Listener.Addr().String())
+-	}
+-	var passes []transfer
+-	for i := 0; i < 2; i++ {
+-		measurement := j.download(netip.MustParseAddr("104.16.0.1"), quota, 0)
+-		if measurement.error != "" || measurement.bytes != quota || measurement.measured != quota-65536 || measurement.duration <= 0 || !measurement.short {
+-			t.Fatalf("production transfer did not measure quota: %+v", measurement)
++	candidate := netip.MustParseAddr("1.1.1.1")
++	newJob := func(path string) *job {
++		u, _ := url.Parse("https://example.com" + path + "?token=private-token")
++		latency, stability := 10.0, 1.0
++		j := &job{ctx: context.Background(), url: u, allowed: map[netip.Addr]bool{candidate: true}, snapshot: Snapshot{State: "running", Results: []Result{{IP: candidate.String(), State: "screened", LatencyMs: &latency, Stability: &stability}}}}
++		j.dial = func(ctx context.Context, ip netip.Addr) (net.Conn, error) {
++			if ip != candidate {
++				t.Errorf("candidate changed: %s", ip)
++			}
++			return (&net.Dialer{}).DialContext(ctx, "tcp", server.Listener.Addr().String())
+ 		}
+-		passes = append(passes, measurement)
++		return j
+ 	}
+-	snapshot := j.copy()
+-	if snapshot.BytesRead != 2*quota || snapshot.Results[0].BytesRead != 2*quota {
+-		t.Fatalf("actual body bytes were not accounted: %+v", snapshot)
++	for _, path := range []string{"/binary", "/missing", "/plain", "/identity", "/eof"} {
++		t.Run(path, func(t *testing.T) {
++			j := newJob(path)
++			var passes []transfer
++			for i := 0; i < 2; i++ {
++				m := j.download(candidate, quota, 0)
++				if m.error != "" || m.measured == 0 || m.duration.Milliseconds() == 0 || !m.short {
++					t.Fatalf("invalid production sample: %+v", m)
++				}
++				passes = append(passes, m)
++			}
++			snapshot := j.copy()
++			if snapshot.BytesRead != passes[0].bytes+passes[1].bytes || snapshot.Results[0].BytesRead != snapshot.BytesRead {
++				t.Fatal("body accounting mismatch")
++			}
++			mergeTransfers(&snapshot.Results[0], passes)
++			score(snapshot.Results)
++			r := snapshot.Results[0]
++			if r.State != "short" || r.MeanRate == nil || *r.MeanRate <= 0 || r.PeakRate == nil || *r.PeakRate <= 0 || r.Score == nil || *r.Score <= 0 || *r.Score > 1 {
++				t.Fatalf("positive production passes did not rank: %+v", r)
++			}
++		})
+ 	}
+-	mergeTransfers(&snapshot.Results[0], passes)
+-	score(snapshot.Results)
+-	r := snapshot.Results[0]
+-	if r.State != "short" || r.MeanRate == nil || *r.MeanRate <= 0 || r.PeakRate == nil || *r.PeakRate <= 0 || r.Score == nil || *r.Score <= 0 || *r.Score > 1 {
+-		t.Fatalf("positive production throughput did not rank: %+v", r)
++	for _, tc := range []struct {
++		path, code string
++		status     uint16
++	}{
++		{"/html", "unsupported_content", 0}, {"/compressed", "unsupported_encoding", 0}, {"/split-html", "unsupported_content", 0}, {"/split-json", "unsupported_content", 0},
++		{"/status403", "http_status", 403}, {"/status429", "rate_limited", 429}, {"/status500", "http_status", 500}, {"/redirect", "http_status", 302},
++		{"/unexpected", "body_read_failed", 0}, {"/empty", "no_measured_data", 0}, {"/setup", "setup_timeout", 0},
++	} {
++		t.Run(tc.path, func(t *testing.T) {
++			j := newJob(tc.path)
++			before := requests.Load()
++			m := j.download(candidate, quota, 0)
++			if m.diagnostic == nil || m.diagnostic.Code != tc.code || m.diagnostic.HTTPStatus != tc.status || requests.Load() != before+1 || strings.Contains(m.error, "private-token") {
++				t.Fatalf("wrong safe diagnostic: %+v", m)
++			}
++			if tc.status == 429 && (m.diagnostic.RetryAfterSeconds == nil || *m.diagnostic.RetryAfterSeconds != 86400) {
++				t.Fatal("retry-after not bounded")
++			}
++			if j.copy().BytesRead != m.bytes {
++				t.Fatal("failed body accounting mismatch")
++			}
++		})
+ 	}
++	t.Run("headers then full body window", func(t *testing.T) {
++		j := newJob("/window")
++		start := time.Now()
++		m := j.download(candidate, BudgetBytes, 0)
++		elapsed := time.Since(start)
++		if m.error != "" || m.short || m.finishReason != "window" || m.duration < 7500*time.Millisecond || elapsed < 9*time.Second || elapsed > 12*time.Second {
++			t.Fatalf("setup consumed or cancelled body window: %+v total=%v", m, elapsed)
++		}
++		select {
++		case <-windowStopped:
++		case <-time.After(time.Second):
++			t.Fatal("body window did not close server request")
++		}
++	})
++	t.Run("cancel production body", func(t *testing.T) {
++		j := newJob("/window")
++		ctx, cancel := context.WithCancel(context.Background())
++		j.ctx = ctx
++		time.AfterFunc(1400*time.Millisecond, cancel)
++		start := time.Now()
++		m := j.download(candidate, BudgetBytes, 0)
++		if m.diagnostic == nil || m.diagnostic.Code != "cancelled" || time.Since(start) > 2*time.Second {
++			t.Fatalf("body cancellation: %+v", m)
++		}
++		select {
++		case <-windowStopped:
++		case <-time.After(time.Second):
++			t.Fatal("cancellation did not close server request")
++		}
++	})
++	t.Run("first 429 stops all later requests", func(t *testing.T) {
++		j := newJob("/status429")
++		ctx, cancel := context.WithCancel(context.Background())
++		defer cancel()
++		j.ctx, j.cancel = ctx, cancel
++		j.snapshot.Sources = []Source{}
++		for _, domain := range PreferredDomains() {
++			j.snapshot.Sources = append(j.snapshot.Sources, Source{Name: domain, State: "pending", IPs: []string{}})
++		}
++		j.lookup = func(context.Context, string, bool) ([]netip.Addr, error) {
++			return []netip.Addr{candidate, netip.MustParseAddr("8.8.8.8")}, nil
++		}
++		j.dial = func(ctx context.Context, _ netip.Addr) (net.Conn, error) {
++			return (&net.Dialer{}).DialContext(ctx, "tcp", server.Listener.Addr().String())
++		}
++		before := requests.Load()
++		j.run()
++		s := j.copy()
++		if requests.Load() != before+1 || s.Diagnostic == nil || s.Diagnostic.Code != "rate_limited" || s.Results[0].State != "failed" || s.Results[1].State != "untested" || s.Results[1].Score != nil {
++			t.Fatalf("429 did not globally stop: %+v", s)
++		}
++	})
+ }
+ 
+-func TestInputAndPinnedSampling(t *testing.T) {
++func TestInputAndDomainCandidates(t *testing.T) {
+ 	for _, raw := range []string{"http://speed.cloudflare.com/x", "https://user:secret@speed.cloudflare.com/x", "https://speed.cloudflare.com:444/x", "https://127.0.0.1/x", "https://198.18.0.1/x", "https://localhost/x", "https://speed.cloudflare.com/x#fragment"} {
+ 		if _, err := validateURL(raw); err == nil {
+ 			t.Errorf("accepted unsafe URL %q", raw)
+ 		}
+ 	}
+-	if _, err := validateURL("https://speed.cloudflare.com/__down?bytes=200000000"); err != nil {
++	if _, err := validateURL("https://example.com/custom?bytes=1234567"); err != nil {
+ 		t.Fatal(err)
+ 	}
+-	for _, ipv6 := range []bool{false, true} {
+-		ips, err := sampleIPs(ipv6)
+-		if err != nil || len(ips) != 64 {
+-			t.Fatalf("sample count=%d error=%v", len(ips), err)
++	for _, raw := range []string{"127.0.0.1", "10.0.0.1", "198.18.0.1", "192.88.99.1", "2001:db8::1", "3fff::1", "4000::1"} {
++		if publicIP(netip.MustParseAddr(raw)) {
++			t.Errorf("accepted nonpublic %s", raw)
+ 		}
+-		seen := make(map[netip.Addr]bool)
+-		for _, ip := range ips {
+-			if !allowedIP(ip) || seen[ip] || (!ipv6 && ip.Is6()) {
+-				t.Fatalf("invalid sample %s", ip)
+-			}
+-			seen[ip] = true
++	}
++	j := &job{ctx: context.Background(), path: physicalPath{ipv6: true}}
++	calls := make(map[string]int)
++	j.lookup = func(_ context.Context, domain string, ipv6 bool) ([]netip.Addr, error) {
++		calls[domain]++
++		if ipv6 && domain == PreferredDomains()[1] {
++			return nil, errors.New("AAAA fixture failure")
++		}
++		if ipv6 {
++			return []netip.Addr{netip.MustParseAddr("2606:4700::3"), netip.MustParseAddr("2606:4700::2"), netip.MustParseAddr("2606:4700::1")}, nil
++		}
++		return []netip.Addr{netip.MustParseAddr("8.8.8.8"), netip.MustParseAddr("1.1.1.1"), netip.MustParseAddr("1.1.1.1"), netip.MustParseAddr("9.9.9.9"), netip.MustParseAddr("198.18.0.1")}, nil
++	}
++	results, sources := j.resolveCandidates()
++	if len(calls) != 3 || len(results) != 4 || len(sources) != 3 || len(results[0].Sources) != 3 {
++		t.Fatalf("wrong candidate universe: %+v %+v", results, sources)
++	}
++	for i, s := range sources {
++		if calls[s.Name] != 2 || s.State != "resolved" || s.EligibleIPv4 != 3 || !s.Truncated {
++			t.Fatalf("source cap/partial success: %+v", s)
++		}
++		if i == 1 && (s.EligibleIPv6 != 0 || s.Diagnostic == nil || s.Diagnostic.Code != "resolution_failed") {
++			t.Fatalf("AAAA failure lost A: %+v", s)
+ 		}
+ 	}
+-	for _, raw := range []string{"127.0.0.1", "10.0.0.1", "198.18.0.1", "1.1.1.1", "2001:db8::1"} {
+-		if allowedIP(netip.MustParseAddr(raw)) {
+-			t.Errorf("accepted non-candidate %s", raw)
++	j.allowed = map[netip.Addr]bool{netip.MustParseAddr(results[0].IP): true}
++	var dials int
++	j.dial = func(context.Context, netip.Addr) (net.Conn, error) { dials++; return nil, errors.New("unused") }
++	for _, raw := range []string{"9.9.9.9", "127.0.0.1", "198.18.0.1"} {
++		ip := netip.MustParseAddr(raw)
++		if !publicIP(ip) {
++			j.allowed[ip] = true
++		}
++		if _, err := j.dialCandidate(context.Background(), ip); err == nil {
++			t.Fatal("unsafe candidate accepted")
+ 		}
+ 	}
++	if dials != 0 {
++		t.Fatal("dial escaped frozen selected answers")
++	}
++	j.path.ipv6 = false
++	_, sources = j.resolveCandidates()
++	for _, s := range sources {
++		if s.EligibleIPv6 != 0 || len(s.IPs) != 2 {
++			t.Fatal("disabled IPv6 included")
++		}
++	}
++	j.lookup = func(context.Context, string, bool) ([]netip.Addr, error) { return nil, errors.New("DNS fixture error") }
++	results, sources = j.resolveCandidates()
++	if len(results) != 0 || len(sources) != 3 {
++		t.Fatal("failed DNS fell back to random or endpoint addresses")
++	}
+ }
+ 
+ func TestForcedCandidateHostSNIAndResponseValidation(t *testing.T) {
+@@ -135,7 +333,7 @@ func TestForcedCandidateHostSNIAndResponseValidation(t *testing.T) {
+ 	}))
+ 	defer server.Close()
+ 	u, _ := url.Parse("https://example.com/body?secret=not-in-errors")
+-	j := &job{url: u, dial: func(ctx context.Context, ip netip.Addr) (net.Conn, error) {
++	j := &job{url: u, allowed: map[netip.Addr]bool{netip.MustParseAddr("104.16.0.1"): true}, dial: func(ctx context.Context, ip netip.Addr) (net.Conn, error) {
+ 		if ip.String() != "104.16.0.1" {
+ 			t.Errorf("wrong forced candidate %s", ip)
+ 		}
+@@ -147,14 +345,20 @@ func TestForcedCandidateHostSNIAndResponseValidation(t *testing.T) {
+ 	pool.AddCert(server.Certificate())
+ 	transport.TLSClientConfig = &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12}
+ 	defer client.CloseIdleConnections()
+-	response, err := j.request(context.Background(), client, http.MethodHead)
++	response, err := j.request(context.Background(), client)
+ 	if err != nil {
+ 		t.Fatal(err)
+ 	}
+ 	response.Body.Close()
+ 	for _, path := range []string{"/redirect", "/html"} {
+ 		j.url.Path = path
+-		if _, err := j.request(context.Background(), client, http.MethodGet); err == nil {
++		response, err := j.request(context.Background(), client)
++		if err != nil {
++			t.Fatal(err)
++		}
++		d := checkResponse(response)
++		response.Body.Close()
++		if d == nil {
+ 			t.Fatalf("accepted %s", path)
+ 		}
+ 	}
+@@ -164,7 +368,7 @@ func TestForcedCandidateHostSNIAndResponseValidation(t *testing.T) {
+ 	j.url.Path = "/body"
+ 	badClient := j.client(netip.MustParseAddr("104.16.0.1"))
+ 	defer badClient.CloseIdleConnections()
+-	if _, err := j.request(context.Background(), badClient, http.MethodGet); err == nil {
++	if _, err := j.request(context.Background(), badClient); err == nil {
+ 		t.Fatal("untrusted certificate accepted")
+ 	}
+ }
+@@ -186,10 +390,14 @@ func (r *readerWithError) Read(p []byte) (int, error) {
+ func TestBodyBudgetWarmupErrorsAndCancellation(t *testing.T) {
+ 	const quota uint64 = 131073
+ 	var accounted uint64
+-	measurement := readTransfer(context.Background(), bytes.NewReader(make([]byte, quota+999)), quota, func(n uint64) { accounted += n })
++	measurement := readTransfer(context.Background(), bytes.NewReader(make([]byte, quota+999)), quota, func(n uint64) { accounted += n; time.Sleep(time.Millisecond) })
+ 	if accounted != quota || measurement.bytes != quota || measurement.measured != quota-65536 || !measurement.short || measurement.error != "" {
+ 		t.Fatalf("bad quota accounting: %+v accounted=%d", measurement, accounted)
+ 	}
++	tooFast := readTransfer(context.Background(), bytes.NewReader(make([]byte, quota)), quota, func(uint64) {})
++	if tooFast.duration.Milliseconds() == 0 && tooFast.error != "no_measured_data" {
++		t.Fatalf("sub-ms data fabricated duration: %+v", tooFast)
++	}
+ 	accounted = 0
+ 	failed := readTransfer(context.Background(), &readerWithError{remaining: 100}, quota, func(n uint64) { accounted += n })
+ 	if accounted != 100 || failed.error == "" {
+@@ -202,7 +410,7 @@ func TestBodyBudgetWarmupErrorsAndCancellation(t *testing.T) {
+ 	if accounted != 0 {
+ 		t.Fatal("read after cancellation")
+ 	}
+-	for targets := 1; targets <= 11; targets++ {
++	for targets := 1; targets <= 12; targets++ {
+ 		perPass := BudgetBytes / uint64(2*targets)
+ 		if perPass*uint64(2*targets) > BudgetBytes || BudgetBytes-perPass*uint64(2*targets) >= uint64(2*targets) {
+ 			t.Fatal("unfair quota allocation")
+@@ -241,6 +449,28 @@ func TestCancelledHTTPSStopsBodyReads(t *testing.T) {
+ 	}
+ }
+ 
++func TestAdequateEOFOutranksSlowerWindow(t *testing.T) {
++	const size = 352 * 1024
++	fast := readTransfer(context.Background(), bytes.NewReader(make([]byte, size)), size+1, func(uint64) { time.Sleep(250 * time.Millisecond) })
++	if fast.error != "" || fast.finishReason != "eof" || fast.short || fast.duration < 2500*time.Millisecond || len(fast.windows) < 4 {
++		t.Fatalf("adequate EOF was penalized as short: %+v", fast)
++	}
++	slow := fast
++	slow.duration, slow.finishReason = 8*time.Second, "window"
++	slow.windows = make([]float64, 32)
++	for i := range slow.windows {
++		slow.windows[i] = float64(slow.measured) / slow.duration.Seconds()
++	}
++	latency, stability := 10.0, 1.0
++	results := []Result{{State: "screened", LatencyMs: &latency, Stability: &stability}, {State: "screened", LatencyMs: &latency, Stability: &stability}}
++	mergeTransfers(&results[0], []transfer{fast, fast})
++	mergeTransfers(&results[1], []transfer{slow, slow})
++	score(results)
++	if results[0].State != "complete" || results[1].State != "complete" || results[0].FinishReason != "eof" || results[0].Score == nil || results[1].Score == nil || *results[0].Score <= *results[1].Score {
++		t.Fatalf("faster adequate EOF did not outrank slow full window: %+v", results)
++	}
++}
++
+ func TestScoringAndCancellationSnapshot(t *testing.T) {
+ 	ptr := func(v float64) *float64 { return &v }
+ 	results := []Result{
+@@ -257,6 +487,11 @@ func TestScoringAndCancellationSnapshot(t *testing.T) {
+ 	if r.State != "short" || r.Score != nil {
+ 		t.Fatalf("short sample lost: %+v", r)
+ 	}
++	r = Result{State: "screened"}
++	mergeTransfers(&r, []transfer{{measured: 100, duration: time.Second, windows: []float64{100}}, {measured: 100, duration: time.Second, windows: []float64{100}, error: "body_read_failed", diagnostic: &Diagnostic{Stage: "body", Code: "body_read_failed"}}})
++	if r.State != "failed" || r.MeanRate != nil || r.Score != nil {
++		t.Fatal("one failed pass produced a result")
++	}
+ 	ctx, cancel := context.WithCancel(context.Background())
+ 	j := &job{ctx: ctx, cancel: cancel, snapshot: Snapshot{RunID: "fixture", State: "running", Stage: "downloading", Results: []Result{}, Sources: []Source{}}}
+ 	m := &Manager{current: j, active: true}
+diff --git a/component/cloudflaretest/measure.go b/component/cloudflaretest/measure.go
+index 032911d..dc7c67f 100644
+--- a/component/cloudflaretest/measure.go
++++ b/component/cloudflaretest/measure.go
+@@ -1,9 +1,10 @@
+ // SPDX-License-Identifier: GPL-3.0-only
+-// TCP timing, forced-IP HTTP HEAD and the bounded body-read loop are adapted
+-// from XIU2/CloudflareSpeedTest task/{tcping,httping,download}.go at UpstreamCommit.
++// TCP timing and the bounded body-read loop are adapted from XIU2/CloudflareSpeedTest
++// task/{tcping,download}.go at UpstreamCommit; HTTPS identity remains verified.
+ package cloudflaretest
+ 
+ import (
++	"bytes"
+ 	"context"
+ 	"crypto/tls"
+ 	"errors"
+@@ -12,12 +13,18 @@ import (
+ 	"mime"
+ 	"net"
+ 	"net/http"
++	"net/http/httptrace"
+ 	"net/netip"
+ 	"sort"
++	"strconv"
+ 	"strings"
++	"sync/atomic"
+ 	"time"
+ )
+ 
++var errSetupDeadline = errors.New("setup deadline")
++var errBodyWindow = errors.New("body window complete")
++
+ func (j *job) client(ip netip.Addr) *http.Client {
+ 	return &http.Client{
+ 		Transport: &http.Transport{
+@@ -25,47 +32,137 @@ func (j *job) client(ip netip.Addr) *http.Client {
+ 			TLSClientConfig:     &tls.Config{MinVersion: tls.VersionTLS12},
+ 			TLSHandshakeTimeout: 3 * time.Second, ResponseHeaderTimeout: 3 * time.Second,
+ 			MaxResponseHeaderBytes: 32 * 1024,
+-			DialContext:            func(ctx context.Context, _, _ string) (net.Conn, error) { return j.dial(ctx, ip) },
++			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
++				conn, err := j.dialCandidate(ctx, ip)
++				if err != nil {
++					return nil, &requestError{&Diagnostic{Stage: "tcp", Code: "tcp_failed"}}
++				}
++				return conn, nil
++			},
+ 		},
+ 		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+ 	}
+ }
+ 
+-func checkResponse(response *http.Response) error {
++func retryAfter(raw string, now time.Time) *uint32 {
++	raw = strings.TrimSpace(raw)
++	if raw == "" {
++		return nil
++	}
++	var seconds uint64
++	if n, err := strconv.ParseUint(raw, 10, 64); err == nil {
++		seconds = n
++	} else if date, err := http.ParseTime(raw); err == nil {
++		if date.After(now) {
++			seconds = uint64(math.Ceil(date.Sub(now).Seconds()))
++		}
++	} else {
++		return nil
++	}
++	if seconds > 86400 {
++		seconds = 86400
++	}
++	n := uint32(seconds)
++	return &n
++}
++
++func contentCategory(raw string) string {
++	if raw == "" {
++		return "missing"
++	}
++	kind, _, err := mime.ParseMediaType(raw)
++	if err != nil {
++		return "other"
++	}
++	switch kind {
++	case "text/html", "application/xhtml+xml":
++		return "html"
++	case "application/json", "text/json":
++		return "json"
++	case "text/plain":
++		return "plain"
++	case "application/octet-stream", "binary/octet-stream", "application/binary", "application/x-binary", "application/download", "application/x-download":
++		return "binary"
++	}
++	if strings.HasSuffix(kind, "+json") {
++		return "json"
++	}
++	if strings.HasPrefix(kind, "image/") || strings.HasPrefix(kind, "audio/") || strings.HasPrefix(kind, "video/") {
++		return "binary"
++	}
++	return "other"
++}
++
++func checkResponse(response *http.Response) *Diagnostic {
+ 	if response.StatusCode != http.StatusOK {
+-		return errors.New("test source returned a non-200 status (redirects are disabled)")
++		d := &Diagnostic{Stage: "http", Code: "http_status", HTTPStatus: uint16(response.StatusCode)}
++		if response.StatusCode == http.StatusTooManyRequests {
++			d.Code = "rate_limited"
++			d.RetryAfterSeconds = retryAfter(response.Header.Get("Retry-After"), time.Now())
++		}
++		return d
+ 	}
+-	kind, _, err := mime.ParseMediaType(response.Header.Get("Content-Type"))
+-	if err != nil || kind != "application/octet-stream" || response.Header.Get("Content-Encoding") != "" {
+-		return errors.New("test source must return uncompressed application/octet-stream, not a web page")
++	if encoding := strings.TrimSpace(response.Header.Get("Content-Encoding")); encoding != "" && !strings.EqualFold(encoding, "identity") {
++		return &Diagnostic{Stage: "content", Code: "unsupported_encoding"}
++	}
++	category := contentCategory(response.Header.Get("Content-Type"))
++	if category == "html" || category == "json" || category == "other" {
++		return &Diagnostic{Stage: "content", Code: "unsupported_content", ContentType: category}
+ 	}
+ 	return nil
+ }
+ 
+-func (j *job) request(ctx context.Context, client *http.Client, method string) (*http.Response, error) {
+-	req, err := http.NewRequestWithContext(ctx, method, j.url.String(), nil)
++type requestError struct{ diagnostic *Diagnostic }
++
++func (e *requestError) Error() string { return e.diagnostic.Code }
++
++func (j *job) request(ctx context.Context, client *http.Client) (*http.Response, error) {
++	req, err := http.NewRequestWithContext(ctx, http.MethodGet, j.url.String(), nil)
+ 	if err != nil {
+-		return nil, errors.New("invalid test source request")
++		return nil, &requestError{&Diagnostic{Stage: "headers", Code: "request_failed"}}
+ 	}
+ 	req.Header.Set("Accept", "application/octet-stream")
++	req.Header.Set("Accept-Encoding", "identity")
+ 	req.Header.Set("User-Agent", "mihomo/"+EngineVersion)
++	var tlsFailed atomic.Bool
++	req = req.WithContext(httptrace.WithClientTrace(req.Context(), &httptrace.ClientTrace{
++		TLSHandshakeDone: func(_ tls.ConnectionState, err error) {
++			if err != nil {
++				tlsFailed.Store(true)
++			}
++		},
++	}))
+ 	response, err := client.Do(req)
+ 	if err != nil {
+-		return nil, errors.New("test source HTTPS request failed (check source availability and certificate)")
+-	}
+-	if err = checkResponse(response); err != nil {
+-		response.Body.Close()
+-		return nil, err
++		d := &Diagnostic{Stage: "headers", Code: "request_failed"}
++		var dialError *requestError
++		if errors.As(err, &dialError) {
++			d = dialError.diagnostic
++		}
++		if tlsFailed.Load() {
++			d.Stage, d.Code = "tls", "tls_failed"
++		}
++		if errors.Is(context.Cause(ctx), errSetupDeadline) {
++			d.Stage, d.Code = "headers", "setup_timeout"
++		}
++		if ctx.Err() != nil && !errors.Is(context.Cause(ctx), errSetupDeadline) {
++			d.Stage, d.Code = "cancel", "cancelled"
++			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
++				d.Code = "deadline_exceeded"
++			}
++		}
++		var timeout net.Error
++		if ctx.Err() == nil && !tlsFailed.Load() && errors.As(err, &timeout) && timeout.Timeout() {
++			d.Code = "setup_timeout"
++		}
++		return nil, &requestError{d}
+ 	}
+ 	return response, nil
+ }
+ 
+ func (j *job) screen(r Result) Result {
+ 	ip := netip.MustParseAddr(r.IP)
+-	client := j.client(ip)
+-	defer client.CloseIdleConnections()
+ 	var latencies []float64
+-	var sourceErr string
+ 	for attempt := 0; attempt < 4; attempt++ {
+ 		if j.ctx.Err() != nil {
+ 			break
+@@ -73,30 +170,19 @@ func (j *job) screen(r Result) Result {
+ 		r.Attempts++
+ 		ctx, cancel := context.WithTimeout(j.ctx, 3*time.Second)
+ 		start := time.Now()
+-		conn, err := j.dial(ctx, ip)
++		conn, err := j.dialCandidate(ctx, ip)
+ 		latency := float64(time.Since(start)) / float64(time.Millisecond)
+ 		if err == nil {
+ 			conn.Close()
+-			response, headErr := j.request(ctx, client, http.MethodHead)
+-			if headErr == nil {
+-				response.Body.Close()
+-				latencies = append(latencies, latency)
+-			} else {
+-				err = headErr
+-				sourceErr = headErr.Error()
+-			}
+-		}
+-		cancel()
+-		if err != nil {
++			latencies = append(latencies, latency)
++		} else {
+ 			r.Failures++
+ 		}
++		cancel()
+ 	}
+ 	if len(latencies) == 0 {
+-		r.State = "failed"
+-		r.Error = "candidate TCP connections failed"
+-		if sourceErr != "" {
+-			r.Error = sourceErr
+-		}
++		r.State, r.Error = "failed", "tcp_failed"
++		r.Diagnostic = &Diagnostic{Stage: "tcp", Code: "tcp_failed"}
+ 		return r
+ 	}
+ 	latency := average(latencies)
+@@ -106,46 +192,81 @@ func (j *job) screen(r Result) Result {
+ }
+ 
+ type transfer struct {
+-	bytes    uint64
+-	measured uint64
+-	duration time.Duration
+-	windows  []float64
+-	short    bool
+-	error    string
++	bytes        uint64
++	measured     uint64
++	duration     time.Duration
++	windows      []float64
++	short        bool
++	error        string
++	diagnostic   *Diagnostic
++	finishReason string
+ }
+ 
++func failedTransfer(d *Diagnostic) transfer { return transfer{error: d.Code, diagnostic: d} }
++
+ func (j *job) download(ip netip.Addr, quota uint64, index int) transfer {
+-	ctx, cancel := context.WithTimeout(j.ctx, 8*time.Second)
+-	defer cancel()
++	ctx, cancel := context.WithCancelCause(j.ctx)
++	defer cancel(nil)
++	setup := time.AfterFunc(5*time.Second, func() { cancel(errSetupDeadline) })
++	defer setup.Stop()
+ 	client := j.client(ip)
+ 	defer client.CloseIdleConnections()
+-	response, err := j.request(ctx, client, http.MethodGet)
++	response, err := j.request(ctx, client)
+ 	if err != nil {
+-		return transfer{error: err.Error()}
++		return failedTransfer(err.(*requestError).diagnostic)
+ 	}
+ 	defer response.Body.Close()
++	if !setup.Stop() {
++		return failedTransfer(&Diagnostic{Stage: "headers", Code: "setup_timeout"})
++	}
++	// Keep the original request context alive: canceling a setup child also
++	// cancels net/http body reads after the response headers have arrived.
++	window := time.AfterFunc(8*time.Second, func() { cancel(errBodyWindow) })
++	defer window.Stop()
++	if d := checkResponse(response); d != nil {
++		return failedTransfer(d)
++	}
+ 	return readTransfer(ctx, response.Body, quota, func(n uint64) {
+-		j.change(func(s *Snapshot) { s.BytesRead += n; s.Results[index].BytesRead += n })
++		j.mu.Lock()
++		defer j.mu.Unlock()
++		j.snapshot.BytesRead += n
++		j.snapshot.Results[index].BytesRead += n
++		j.snapshot.Revision++
+ 	})
+ }
+ 
+-// All body bytes, including warmup and bytes returned with an error, consume
+-// quota. HTTP/TLS framing and kernel buffering are outside the body budget.
++func badPrefix(prefix []byte) bool {
++	text := strings.ToLower(string(bytes.TrimSpace(prefix)))
++	// ASCII fill is legitimate transfer data too. Only reject page/error
++	// signatures, not all printable text or a missing server MIME header.
++	for _, start := range []string{"<", "{", "[", "error:", "access denied", "bad gateway", "forbidden", "too many requests"} {
++		if strings.HasPrefix(text, start) {
++			return true
++		}
++	}
++	return false
++}
++
++// Sniffing, warmup, and bytes returned with an error each consume quota once.
++// HTTP/TLS framing and kernel buffering are outside the response-body budget.
+ func readTransfer(ctx context.Context, body io.Reader, quota uint64, account func(uint64)) transfer {
+ 	t := transfer{}
+ 	buffer := make([]byte, 32*1024)
++	prefix := make([]byte, 0, 512)
+ 	var measuredStart, windowStart time.Time
+ 	var windowBytes uint64
+ 	warmup := uint64(64 * 1024)
+ 	if quota < warmup {
+ 		warmup = quota
+ 	}
+-	first := true
+ 	for t.bytes < quota && ctx.Err() == nil {
+ 		want := uint64(len(buffer))
+ 		if left := quota - t.bytes; left < want {
+ 			want = left
+ 		}
++		if len(prefix) < 512 && uint64(512-len(prefix)) < want {
++			want = uint64(512 - len(prefix))
++		}
+ 		if t.bytes < warmup && warmup-t.bytes < want {
+ 			want = warmup - t.bytes
+ 		}
+@@ -155,12 +276,13 @@ func readTransfer(ctx context.Context, body io.Reader, quota uint64, account fun
+ 			before := t.bytes
+ 			t.bytes += uint64(n)
+ 			account(uint64(n))
+-			if first {
+-				first = false
+-				prefix := strings.ToLower(strings.TrimSpace(string(buffer[:n])))
+-				if strings.HasPrefix(prefix, "<!doctype html") || strings.HasPrefix(prefix, "<html") {
+-					t.error = "test source returned an HTML page"
+-					break
++			if len(prefix) < 512 {
++				prefix = append(prefix, buffer[:n]...)
++				if len(prefix) == 512 || err != nil {
++					if badPrefix(prefix) {
++						t.diagnostic = &Diagnostic{Stage: "content", Code: "unsupported_content"}
++						break
++					}
+ 				}
+ 			}
+ 			if before >= warmup {
+@@ -175,29 +297,53 @@ func readTransfer(ctx context.Context, body io.Reader, quota uint64, account fun
+ 			}
+ 		}
+ 		if err != nil {
+-			if err != io.EOF && !(errors.Is(ctx.Err(), context.DeadlineExceeded) && t.measured > 0) {
+-				t.error = "test source body read failed"
++			if err == io.EOF {
++				t.finishReason = "eof"
++			} else if errors.Is(context.Cause(ctx), errBodyWindow) && (errors.Is(err, context.Canceled) || errors.Is(err, errBodyWindow)) {
++				t.finishReason = "window"
++			} else {
++				t.diagnostic = &Diagnostic{Stage: "body", Code: "body_read_failed"}
+ 			}
+ 			break
+ 		}
+ 		if n == 0 {
+-			t.error = "test source returned an empty body read"
++			t.diagnostic = &Diagnostic{Stage: "body", Code: "body_read_failed"}
+ 			break
+ 		}
+ 	}
++	if t.diagnostic == nil && badPrefix(prefix) {
++		t.diagnostic = &Diagnostic{Stage: "content", Code: "unsupported_content"}
++	}
++	if ctx.Err() != nil && !errors.Is(context.Cause(ctx), errBodyWindow) {
++		t.diagnostic = &Diagnostic{Stage: "cancel", Code: "cancelled"}
++		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
++			t.diagnostic.Code = "deadline_exceeded"
++		}
++	}
+ 	if !measuredStart.IsZero() {
+-		t.duration = time.Since(measuredStart)
+-		if windowBytes > 0 && time.Since(windowStart) > 0 {
+-			t.windows = append(t.windows, float64(windowBytes)/time.Since(windowStart).Seconds())
++		now := time.Now()
++		t.duration = now.Sub(measuredStart)
++		if windowBytes > 0 && now.After(windowStart) {
++			t.windows = append(t.windows, float64(windowBytes)/now.Sub(windowStart).Seconds())
+ 		}
+ 	}
+-	if t.measured == 0 && t.error == "" {
+-		t.error = "test source ended before measured data after warmup"
++	if t.diagnostic == nil {
++		if t.finishReason == "" {
++			if t.bytes == quota {
++				t.finishReason = "quota"
++			} else if errors.Is(context.Cause(ctx), errBodyWindow) {
++				t.finishReason = "window"
++			}
++		}
++		if t.measured == 0 || t.duration.Milliseconds() == 0 || len(t.windows) == 0 {
++			t.diagnostic = &Diagnostic{Stage: "body", Code: "no_measured_data"}
++		}
+ 	}
+-	t.short = t.bytes == quota && t.duration < 2*time.Second
+-	if t.bytes < quota && t.duration < 2*time.Second && t.error == "" {
+-		t.error = "test source ended before the minimum sample duration or allocated body quota"
++	if t.diagnostic != nil {
++		t.error = t.diagnostic.Code
++		t.finishReason = ""
+ 	}
++	t.short = t.error == "" && (t.duration < 2*time.Second || len(t.windows) < 4)
+ 	return t
+ }
+ 
+@@ -207,36 +353,39 @@ func mergeTransfers(r *Result, samples []transfer) {
+ 	var windows, means []float64
+ 	short := false
+ 	valid := 0
+-	r.Error = ""
++	r.Error, r.Diagnostic, r.FinishReason = "", nil, ""
++	r.MeanRate, r.PeakRate, r.Score = nil, nil, nil
+ 	for _, t := range samples {
+-		measured += t.measured
+ 		duration += t.duration
+-		windows = append(windows, t.windows...)
+-		short = short || t.short
+ 		if t.error != "" {
+-			r.Error = t.error
++			r.Error, r.Diagnostic = t.error, t.diagnostic
+ 		}
+-		if t.error == "" && t.measured > 0 && t.duration > 0 {
++		if t.error == "" && t.measured > 0 && t.duration.Milliseconds() > 0 && len(t.windows) > 0 {
+ 			valid++
++			measured += t.measured
++			windows = append(windows, t.windows...)
+ 			means = append(means, float64(t.measured)/t.duration.Seconds())
++			short = short || t.short
++			if r.FinishReason == "" || t.finishReason != "window" {
++				r.FinishReason = t.finishReason
++			}
+ 		}
+ 	}
+ 	r.DurationMs = uint64(duration.Milliseconds())
+-	if measured > 0 && duration > 0 {
+-		mean, peak := float64(measured)/duration.Seconds(), percentile(windows, .9)
+-		r.MeanRate, r.PeakRate = &mean, &peak
+-	}
+ 	if len(samples) < 2 {
+ 		return
+ 	}
+ 	if valid != 2 {
+ 		r.State = "failed"
++		r.FinishReason = ""
+ 		return
+ 	}
+ 	r.State = "complete"
+ 	if short {
+ 		r.State = "short"
+ 	}
++	mean, peak := float64(measured)/duration.Seconds(), percentile(windows, .9)
++	r.MeanRate, r.PeakRate = &mean, &peak
+ 	stability := 1.0
+ 	if r.Stability != nil {
+ 		stability = *r.Stability
+@@ -274,13 +423,13 @@ func percentile(values []float64, p float64) float64 {
+ 	}
+ 	copy := append([]float64{}, values...)
+ 	sort.Float64s(copy)
+-	return copy[int(math.Ceil(float64(len(copy))*p))-1]
++	return copy[int(math.Ceil(float64(len(values))*p))-1]
+ }
+ 
+ func score(results []Result) {
+ 	maxMean, maxPeak, minLatency := 0.0, 0.0, math.MaxFloat64
+ 	eligible := func(r Result) bool {
+-		return (r.State == "complete" || r.State == "short") && r.MeanRate != nil && *r.MeanRate > 0 && r.PeakRate != nil && r.LatencyMs != nil && r.Stability != nil
++		return (r.State == "complete" || r.State == "short") && r.MeanRate != nil && *r.MeanRate > 0 && r.PeakRate != nil && *r.PeakRate > 0 && r.LatencyMs != nil && r.Stability != nil
+ 	}
+ 	for _, r := range results {
+ 		if !eligible(r) {
+@@ -292,6 +441,7 @@ func score(results []Result) {
+ 	}
+ 	for i := range results {
+ 		r := &results[i]
++		r.Score = nil
+ 		if !eligible(*r) {
+ 			continue
+ 		}
+@@ -299,11 +449,7 @@ func score(results []Result) {
+ 		if *r.LatencyMs > 0 {
+ 			latency = minLatency / *r.LatencyMs
+ 		}
+-		peak := 0.0
+-		if maxPeak > 0 {
+-			peak = *r.PeakRate / maxPeak
+-		}
+-		value := .45*(*r.MeanRate/maxMean) + .25*peak + .15*latency + .15*math.Max(0, math.Min(1, *r.Stability))
++		value := .45*(*r.MeanRate/maxMean) + .25*(*r.PeakRate/maxPeak) + .15*latency + .15*math.Max(0, math.Min(1, *r.Stability))
+ 		r.Score = &value
+ 	}
+ }
+diff --git a/component/cloudflaretest/network.go b/component/cloudflaretest/network.go
+index bae7872..09999cb 100644
+--- a/component/cloudflaretest/network.go
++++ b/component/cloudflaretest/network.go
+@@ -31,7 +31,7 @@ func validateURL(raw string) (*url.URL, error) {
+ 
+ func publicIP(ip netip.Addr) bool {
+ 	ip = ip.Unmap()
+-	if !ip.IsGlobalUnicast() || ip.IsPrivate() || ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsUnspecified() {
++	if ip.Zone() != "" || !ip.IsGlobalUnicast() || ip.IsPrivate() || ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsUnspecified() || (ip.Is6() && !netip.MustParsePrefix("2000::/3").Contains(ip)) {
+ 		return false
+ 	}
+ 	for _, p := range nonPublic {
+@@ -44,11 +44,11 @@ func publicIP(ip netip.Addr) bool {
+ 
+ var nonPublic = []netip.Prefix{
+ 	netip.MustParsePrefix("0.0.0.0/8"), netip.MustParsePrefix("100.64.0.0/10"),
+-	netip.MustParsePrefix("192.0.0.0/24"), netip.MustParsePrefix("192.0.2.0/24"),
++	netip.MustParsePrefix("192.0.0.0/24"), netip.MustParsePrefix("192.0.2.0/24"), netip.MustParsePrefix("192.88.99.0/24"),
+ 	netip.MustParsePrefix("198.18.0.0/15"), netip.MustParsePrefix("198.51.100.0/24"),
+-	netip.MustParsePrefix("203.0.113.0/24"), netip.MustParsePrefix("240.0.0.0/4"),
++	netip.MustParsePrefix("203.0.113.0/24"), netip.MustParsePrefix("240.0.0.0/4"), netip.MustParsePrefix("224.0.0.0/4"),
+ 	netip.MustParsePrefix("2001:db8::/32"), netip.MustParsePrefix("2001::/23"),
+-	netip.MustParsePrefix("64:ff9b::/96"), netip.MustParsePrefix("2002::/16"),
++	netip.MustParsePrefix("64:ff9b::/96"), netip.MustParsePrefix("2002::/16"), netip.MustParsePrefix("3fff::/20"),
+ }
+ 
+ type physicalPath struct {
+@@ -105,7 +105,7 @@ func routeInterface(ctx context.Context) (string, error) {
+ 	}
+ 	ifaces, err := net.Interfaces()
+ 	if err != nil {
+-		return "", err
++		return "", errors.New("physical interface enumeration failed")
+ 	}
+ 	for _, i := range ifaces {
+ 		addrs, _ := i.Addrs()
+@@ -162,8 +162,8 @@ func (p physicalPath) verify(ctx context.Context) error {
+ }
+ 
+ func (p physicalPath) dial(ctx context.Context, ip netip.Addr) (net.Conn, error) {
+-	if !allowedIP(ip) {
+-		return nil, errors.New("candidate is outside the pinned public Cloudflare ranges")
++	if !publicIP(ip) {
++		return nil, errors.New("candidate is not a public address")
+ 	}
+ 	if err := p.verify(ctx); err != nil {
+ 		return nil, err
+diff --git a/component/cloudflaretest/sample.go b/component/cloudflaretest/sample.go
+index 8c59804..e5137a7 100644
+--- a/component/cloudflaretest/sample.go
++++ b/component/cloudflaretest/sample.go
+@@ -2,79 +2,43 @@
+ package cloudflaretest
+ 
+ import (
+-	"crypto/rand"
+ 	"net/netip"
+-	"strings"
++	"sort"
+ )
+ 
+-var candidateRanges = func() []netip.Prefix {
+-	var ranges []netip.Prefix
+-	for _, text := range strings.Fields(upstreamRanges) {
+-		ranges = append(ranges, netip.MustParsePrefix(text))
+-	}
+-	return ranges
+-}()
+-
+-func allowedIP(ip netip.Addr) bool {
+-	ip = ip.Unmap()
+-	if !publicIP(ip) {
+-		return false
+-	}
+-	for _, prefix := range candidateRanges {
+-		if prefix.Contains(ip) {
+-			return true
++func selectCandidates(resolved []netip.Addr, ipv6 bool) (selected []netip.Addr, v4, v6 uint32) {
++	seen := make(map[netip.Addr]bool)
++	for _, ip := range resolved {
++		ip = ip.Unmap()
++		if ip.Zone() != "" || !publicIP(ip) || (ip.Is6() && !ipv6) || seen[ip] {
++			continue
+ 		}
+-	}
+-	return false
+-}
+-
+-// Adapted from task/ip.go chooseIPv4/chooseIPv6: random host bits within
+-// fixed prefixes, without walking or expanding every subnet in the file.
+-func sampleIPs(ipv6 bool) ([]netip.Addr, error) {
+-	var ranges []netip.Prefix
+-	for _, p := range candidateRanges {
+-		if ipv6 || p.Addr().Is4() {
+-			ranges = append(ranges, p)
++		seen[ip] = true
++		if ip.Is4() {
++			v4++
++		} else {
++			v6++
+ 		}
+ 	}
+-	out := make([]netip.Addr, 0, 64)
+-	seen := make(map[netip.Addr]bool)
+-	var seed [2]byte
+-	if _, err := rand.Read(seed[:]); err != nil {
+-		return nil, err
++	all := make([]netip.Addr, 0, len(seen))
++	for ip := range seen {
++		all = append(all, ip)
+ 	}
+-	start := (int(seed[0])<<8 | int(seed[1])) % len(ranges)
+-	if ipv6 {
+-		var v4, v6 []netip.Prefix
+-		for _, p := range ranges {
+-			if p.Addr().Is4() {
+-				v4 = append(v4, p)
+-			} else {
+-				v6 = append(v6, p)
++	sort.Slice(all, func(i, j int) bool { return all[i].Less(all[j]) })
++	var n4, n6 int
++	for _, ip := range all {
++		if ip.Is4() {
++			if n4 == 2 {
++				continue
+ 			}
++			n4++
++		} else {
++			if n6 == 2 {
++				continue
++			}
++			n6++
+ 		}
+-		mixed := make([]netip.Prefix, 0, 64)
+-		for i := 0; i < 32; i++ {
+-			mixed = append(mixed, v4[(start+i)%len(v4)], v6[(start+i)%len(v6)])
+-		}
+-		ranges, start = mixed, 0
+-	}
+-	for attempt := 0; len(out) < 64 && attempt < 256; attempt++ {
+-		p := ranges[(start+attempt)%len(ranges)]
+-		data := p.Addr().AsSlice()
+-		random := make([]byte, len(data))
+-		if _, err := rand.Read(random); err != nil {
+-			return nil, err
+-		}
+-		for bit := p.Bits(); bit < len(data)*8; bit++ {
+-			mask := byte(1 << (7 - bit%8))
+-			data[bit/8] = data[bit/8]&^mask | random[bit/8]&mask
+-		}
+-		ip, _ := netip.AddrFromSlice(data)
+-		if allowedIP(ip) && !seen[ip] {
+-			seen[ip] = true
+-			out = append(out, ip)
+-		}
++		selected = append(selected, ip)
+ 	}
+-	return out, nil
++	return
+ }
+diff --git a/component/cloudflaretest/types.go b/component/cloudflaretest/types.go
+index 6a10c27..91260de 100644
+--- a/component/cloudflaretest/types.go
++++ b/component/cloudflaretest/types.go
+@@ -1,8 +1,8 @@
+ // SPDX-License-Identifier: GPL-3.0-only
+ // Portions adapted from XIU2/CloudflareSpeedTest, commit
+ // 50b42c7f95cfb06413740ce6e1967578ebe63380 (GPL-3.0, see LICENSE).
+-// Changes: context-bound native jobs, physical interface binding, bounded sampling,
+-// fair body quotas, verified HTTPS and measured mean/window-p90 instead of EWMA.
++// Changes: context-bound native jobs, physical interface binding, domain-only
++// candidates, fair body quotas, verified HTTPS and measured mean/window-p90.
+ package cloudflaretest
+ 
+ import "errors"
+@@ -10,12 +10,16 @@ import "errors"
+ const (
+ 	SchemaVersion         = 1
+ 	Capability            = "verge-cloudflare1"
+-	EngineVersion         = "cf-speedtest1"
++	EngineVersion         = "cf-speedtest2"
++	Method                = "verge-cfst-transfer-v2"
+ 	UpstreamCommit        = "50b42c7f95cfb06413740ce6e1967578ebe63380"
+ 	BudgetBytes    uint64 = 256 * 1024 * 1024
+ )
+ 
+-var PreferredDomains = [...]string{"best.cloudflare.182682.xyz", "saas.sin.fan", "best.cloudflare.19931110.xyz"}
++func PreferredDomains() [3]string {
++	return [3]string{"best.cloudflare.182682.xyz", "saas.sin.fan", "best.cloudflare.19931110.xyz"}
++}
++
+ var ErrBusy = errors.New("a benchmark is already running or stopping")
+ var ErrNotFound = errors.New("benchmark run not found")
+ 
+@@ -24,46 +28,61 @@ type Options struct {
+ 	InterfaceName string `json:"interfaceName,omitempty"`
+ }
+ 
++type Diagnostic struct {
++	Stage             string  `json:"stage"`
++	Code              string  `json:"code"`
++	HTTPStatus        uint16  `json:"httpStatus,omitempty"`
++	ContentType       string  `json:"contentType,omitempty"`
++	RetryAfterSeconds *uint32 `json:"retryAfterSeconds,omitempty"`
++}
++
+ type Snapshot struct {
+-	SchemaVersion    int      `json:"schemaVersion"`
+-	Capability       string   `json:"capability"`
+-	RunID            string   `json:"runId"`
+-	Revision         uint64   `json:"revision"`
+-	State            string   `json:"state"`
+-	Stage            string   `json:"stage"`
+-	InterfaceName    string   `json:"interfaceName"`
+-	DNSMode          string   `json:"dnsMode"`
+-	URL              string   `json:"url"`
+-	StartedAt        string   `json:"startedAt"`
+-	FinishedAt       string   `json:"finishedAt,omitempty"`
+-	BytesRead        uint64   `json:"bytesRead"`
+-	BudgetBytes      uint64   `json:"budgetBytes"`
+-	CompletedTargets int      `json:"completedTargets"`
+-	TotalTargets     int      `json:"totalTargets"`
+-	Results          []Result `json:"results"`
+-	Sources          []Source `json:"sources"`
+-	Error            string   `json:"error,omitempty"`
++	SchemaVersion    int         `json:"schemaVersion"`
++	Capability       string      `json:"capability"`
++	RunID            string      `json:"runId"`
++	Revision         uint64      `json:"revision"`
++	State            string      `json:"state"`
++	Stage            string      `json:"stage"`
++	InterfaceName    string      `json:"interfaceName"`
++	DNSMode          string      `json:"dnsMode"`
++	URL              string      `json:"url"`
++	StartedAt        string      `json:"startedAt"`
++	FinishedAt       string      `json:"finishedAt,omitempty"`
++	BytesRead        uint64      `json:"bytesRead"`
++	BudgetBytes      uint64      `json:"budgetBytes"`
++	CompletedTargets int         `json:"completedTargets"`
++	TotalTargets     int         `json:"totalTargets"`
++	Results          []Result    `json:"results"`
++	Sources          []Source    `json:"sources"`
++	Error            string      `json:"error,omitempty"`
++	Diagnostic       *Diagnostic `json:"diagnostic,omitempty"`
+ }
+ 
+ type Result struct {
+-	IP         string   `json:"ip"`
+-	Sources    []string `json:"sources"`
+-	State      string   `json:"state"`
+-	MeanRate   *float64 `json:"meanRate,omitempty"`
+-	PeakRate   *float64 `json:"peakRate,omitempty"`
+-	LatencyMs  *float64 `json:"latencyMs,omitempty"`
+-	Stability  *float64 `json:"stability,omitempty"`
+-	Score      *float64 `json:"score,omitempty"`
+-	BytesRead  uint64   `json:"bytesRead"`
+-	DurationMs uint64   `json:"durationMs"`
+-	Failures   uint32   `json:"failures"`
+-	Attempts   uint32   `json:"attempts"`
+-	Error      string   `json:"error,omitempty"`
++	IP           string      `json:"ip"`
++	Sources      []string    `json:"sources"`
++	State        string      `json:"state"`
++	MeanRate     *float64    `json:"meanRate,omitempty"`
++	PeakRate     *float64    `json:"peakRate,omitempty"`
++	LatencyMs    *float64    `json:"latencyMs,omitempty"`
++	Stability    *float64    `json:"stability,omitempty"`
++	Score        *float64    `json:"score,omitempty"`
++	BytesRead    uint64      `json:"bytesRead"`
++	DurationMs   uint64      `json:"durationMs"`
++	Failures     uint32      `json:"failures"`
++	Attempts     uint32      `json:"attempts"`
++	Error        string      `json:"error,omitempty"`
++	Diagnostic   *Diagnostic `json:"diagnostic,omitempty"`
++	FinishReason string      `json:"finishReason,omitempty"`
+ }
+ 
+ type Source struct {
+-	Name  string   `json:"name"`
+-	IPs   []string `json:"ips"`
+-	State string   `json:"state"`
+-	Error string   `json:"error,omitempty"`
++	Name         string      `json:"name"`
++	IPs          []string    `json:"ips"`
++	State        string      `json:"state"`
++	EligibleIPv4 uint32      `json:"eligibleIpv4"`
++	EligibleIPv6 uint32      `json:"eligibleIpv6"`
++	Truncated    bool        `json:"truncated"`
++	Error        string      `json:"error,omitempty"`
++	Diagnostic   *Diagnostic `json:"diagnostic,omitempty"`
+ }
+diff --git a/component/cloudflaretest/upstream.go b/component/cloudflaretest/upstream.go
+index a318907..3172b43 100644
+--- a/component/cloudflaretest/upstream.go
++++ b/component/cloudflaretest/upstream.go
+@@ -1,130 +1,7 @@
+ // SPDX-License-Identifier: GPL-3.0-only
+ // Source: https://github.com/XIU2/CloudflareSpeedTest/tree/50b42c7f95cfb06413740ce6e1967578ebe63380
+ // Copyright (c) XIU2 and CloudflareSpeedTest contributors.
+-// The following fixed range data and license are preserved from that commit.
++// The following license is preserved from that commit.
+ package cloudflaretest
+ 
+-const upstreamRanges = `173.245.48.0/20
+-103.21.244.0/22
+-103.22.200.0/22
+-103.31.4.0/22
+-141.101.64.0/18
+-108.162.192.0/18
+-190.93.240.0/20
+-188.114.96.0/20
+-197.234.240.0/22
+-198.41.128.0/17
+-162.158.0.0/15
+-104.16.0.0/12
+-172.64.0.0/17
+-172.64.128.0/18
+-172.64.192.0/19
+-172.64.224.0/22
+-172.64.229.0/24
+-172.64.230.0/23
+-172.64.232.0/21
+-172.64.240.0/21
+-172.64.248.0/21
+-172.65.0.0/16
+-172.66.0.0/16
+-172.67.0.0/16
+-131.0.72.0/22
+-2400:cb00:2049::/48
+-2400:cb00:f00e::/48
+-2606:4700::/32
+-2606:4700:10::/48
+-2606:4700:130::/48
+-2606:4700:3000::/48
+-2606:4700:3001::/48
+-2606:4700:3002::/48
+-2606:4700:3003::/48
+-2606:4700:3004::/48
+-2606:4700:3005::/48
+-2606:4700:3006::/48
+-2606:4700:3007::/48
+-2606:4700:3008::/48
+-2606:4700:3009::/48
+-2606:4700:3010::/48
+-2606:4700:3011::/48
+-2606:4700:3012::/48
+-2606:4700:3013::/48
+-2606:4700:3014::/48
+-2606:4700:3015::/48
+-2606:4700:3016::/48
+-2606:4700:3017::/48
+-2606:4700:3018::/48
+-2606:4700:3019::/48
+-2606:4700:3020::/48
+-2606:4700:3021::/48
+-2606:4700:3022::/48
+-2606:4700:3023::/48
+-2606:4700:3024::/48
+-2606:4700:3025::/48
+-2606:4700:3026::/48
+-2606:4700:3027::/48
+-2606:4700:3028::/48
+-2606:4700:3029::/48
+-2606:4700:3030::/48
+-2606:4700:3031::/48
+-2606:4700:3032::/48
+-2606:4700:3033::/48
+-2606:4700:3034::/48
+-2606:4700:3035::/48
+-2606:4700:3036::/48
+-2606:4700:3037::/48
+-2606:4700:3038::/48
+-2606:4700:3039::/48
+-2606:4700:a0::/48
+-2606:4700:a1::/48
+-2606:4700:a8::/48
+-2606:4700:a9::/48
+-2606:4700:a::/48
+-2606:4700:b::/48
+-2606:4700:c::/48
+-2606:4700:d0::/48
+-2606:4700:d1::/48
+-2606:4700:d::/48
+-2606:4700:e0::/48
+-2606:4700:e1::/48
+-2606:4700:e2::/48
+-2606:4700:e3::/48
+-2606:4700:e4::/48
+-2606:4700:e5::/48
+-2606:4700:e6::/48
+-2606:4700:e7::/48
+-2606:4700:e::/48
+-2606:4700:f1::/48
+-2606:4700:f2::/48
+-2606:4700:f3::/48
+-2606:4700:f4::/48
+-2606:4700:f5::/48
+-2606:4700:f::/48
+-2803:f800:50::/48
+-2803:f800:51::/48
+-2a06:98c1:3100::/48
+-2a06:98c1:3101::/48
+-2a06:98c1:3102::/48
+-2a06:98c1:3103::/48
+-2a06:98c1:3104::/48
+-2a06:98c1:3105::/48
+-2a06:98c1:3106::/48
+-2a06:98c1:3107::/48
+-2a06:98c1:3108::/48
+-2a06:98c1:3109::/48
+-2a06:98c1:310a::/48
+-2a06:98c1:310b::/48
+-2a06:98c1:310c::/48
+-2a06:98c1:310d::/48
+-2a06:98c1:310e::/48
+-2a06:98c1:310f::/48
+-2a06:98c1:3120::/48
+-2a06:98c1:3121::/48
+-2a06:98c1:3122::/48
+-2a06:98c1:3123::/48
+-2a06:98c1:3200::/48
+-2a06:98c1:50::/48
+-2a06:98c1:51::/48
+-2a06:98c1:54::/48
+-2a06:98c1:58::/48`
+-
+ const UpstreamLicense = "                    GNU GENERAL PUBLIC LICENSE\n                       Version 3, 29 June 2007\n\n Copyright (C) 2007 Free Software Foundation, Inc. <https://fsf.org/>\n Everyone is permitted to copy and distribute verbatim copies\n of this license document, but changing it is not allowed.\n\n                            Preamble\n\n  The GNU General Public License is a free, copyleft license for\nsoftware and other kinds of works.\n\n  The licenses for most software and other practical works are designed\nto take away your freedom to share and change the works.  By contrast,\nthe GNU General Public License is intended to guarantee your freedom to\nshare and change all versions of a program--to make sure it remains free\nsoftware for all its users.  We, the Free Software Foundation, use the\nGNU General Public License for most of our software; it applies also to\nany other work released this way by its authors.  You can apply it to\nyour programs, too.\n\n  When we speak of free software, we are referring to freedom, not\nprice.  Our General Public Licenses are designed to make sure that you\nhave the freedom to distribute copies of free software (and charge for\nthem if you wish), that you receive source code or can get it if you\nwant it, that you can change the software or use pieces of it in new\nfree programs, and that you know you can do these things.\n\n  To protect your rights, we need to prevent others from denying you\nthese rights or asking you to surrender the rights.  Therefore, you have\ncertain responsibilities if you distribute copies of the software, or if\nyou modify it: responsibilities to respect the freedom of others.\n\n  For example, if you distribute copies of such a program, whether\ngratis or for a fee, you must pass on to the recipients the same\nfreedoms that you received.  You must make sure that they, too, receive\nor can get the source code.  And you must show them these terms so they\nknow their rights.\n\n  Developers that use the GNU GPL protect your rights with two steps:\n(1) assert copyright on the software, and (2) offer you this License\ngiving you legal permission to copy, distribute and/or modify it.\n\n  For the developers' and authors' protection, the GPL clearly explains\nthat there is no warranty for this free software.  For both users' and\nauthors' sake, the GPL requires that modified versions be marked as\nchanged, so that their problems will not be attributed erroneously to\nauthors of previous versions.\n\n  Some devices are designed to deny users access to install or run\nmodified versions of the software inside them, although the manufacturer\ncan do so.  This is fundamentally incompatible with the aim of\nprotecting users' freedom to change the software.  The systematic\npattern of such abuse occurs in the area of products for individuals to\nuse, which is precisely where it is most unacceptable.  Therefore, we\nhave designed this version of the GPL to prohibit the practice for those\nproducts.  If such problems arise substantially in other domains, we\nstand ready to extend this provision to those domains in future versions\nof the GPL, as needed to protect the freedom of users.\n\n  Finally, every program is threatened constantly by software patents.\nStates should not allow patents to restrict development and use of\nsoftware on general-purpose computers, but in those that do, we wish to\navoid the special danger that patents applied to a free program could\nmake it effectively proprietary.  To prevent this, the GPL assures that\npatents cannot be used to render the program non-free.\n\n  The precise terms and conditions for copying, distribution and\nmodification follow.\n\n                       TERMS AND CONDITIONS\n\n  0. Definitions.\n\n  \"This License\" refers to version 3 of the GNU General Public License.\n\n  \"Copyright\" also means copyright-like laws that apply to other kinds of\nworks, such as semiconductor masks.\n\n  \"The Program\" refers to any copyrightable work licensed under this\nLicense.  Each licensee is addressed as \"you\".  \"Licensees\" and\n\"recipients\" may be individuals or organizations.\n\n  To \"modify\" a work means to copy from or adapt all or part of the work\nin a fashion requiring copyright permission, other than the making of an\nexact copy.  The resulting work is called a \"modified version\" of the\nearlier work or a work \"based on\" the earlier work.\n\n  A \"covered work\" means either the unmodified Program or a work based\non the Program.\n\n  To \"propagate\" a work means to do anything with it that, without\npermission, would make you directly or secondarily liable for\ninfringement under applicable copyright law, except executing it on a\ncomputer or modifying a private copy.  Propagation includes copying,\ndistribution (with or without modification), making available to the\npublic, and in some countries other activities as well.\n\n  To \"convey\" a work means any kind of propagation that enables other\nparties to make or receive copies.  Mere interaction with a user through\na computer network, with no transfer of a copy, is not conveying.\n\n  An interactive user interface displays \"Appropriate Legal Notices\"\nto the extent that it includes a convenient and prominently visible\nfeature that (1) displays an appropriate copyright notice, and (2)\ntells the user that there is no warranty for the work (except to the\nextent that warranties are provided), that licensees may convey the\nwork under this License, and how to view a copy of this License.  If\nthe interface presents a list of user commands or options, such as a\nmenu, a prominent item in the list meets this criterion.\n\n  1. Source Code.\n\n  The \"source code\" for a work means the preferred form of the work\nfor making modifications to it.  \"Object code\" means any non-source\nform of a work.\n\n  A \"Standard Interface\" means an interface that either is an official\nstandard defined by a recognized standards body, or, in the case of\ninterfaces specified for a particular programming language, one that\nis widely used among developers working in that language.\n\n  The \"System Libraries\" of an executable work include anything, other\nthan the work as a whole, that (a) is included in the normal form of\npackaging a Major Component, but which is not part of that Major\nComponent, and (b) serves only to enable use of the work with that\nMajor Component, or to implement a Standard Interface for which an\nimplementation is available to the public in source code form.  A\n\"Major Component\", in this context, means a major essential component\n(kernel, window system, and so on) of the specific operating system\n(if any) on which the executable work runs, or a compiler used to\nproduce the work, or an object code interpreter used to run it.\n\n  The \"Corresponding Source\" for a work in object code form means all\nthe source code needed to generate, install, and (for an executable\nwork) run the object code and to modify the work, including scripts to\ncontrol those activities.  However, it does not include the work's\nSystem Libraries, or general-purpose tools or generally available free\nprograms which are used unmodified in performing those activities but\nwhich are not part of the work.  For example, Corresponding Source\nincludes interface definition files associated with source files for\nthe work, and the source code for shared libraries and dynamically\nlinked subprograms that the work is specifically designed to require,\nsuch as by intimate data communication or control flow between those\nsubprograms and other parts of the work.\n\n  The Corresponding Source need not include anything that users\ncan regenerate automatically from other parts of the Corresponding\nSource.\n\n  The Corresponding Source for a work in source code form is that\nsame work.\n\n  2. Basic Permissions.\n\n  All rights granted under this License are granted for the term of\ncopyright on the Program, and are irrevocable provided the stated\nconditions are met.  This License explicitly affirms your unlimited\npermission to run the unmodified Program.  The output from running a\ncovered work is covered by this License only if the output, given its\ncontent, constitutes a covered work.  This License acknowledges your\nrights of fair use or other equivalent, as provided by copyright law.\n\n  You may make, run and propagate covered works that you do not\nconvey, without conditions so long as your license otherwise remains\nin force.  You may convey covered works to others for the sole purpose\nof having them make modifications exclusively for you, or provide you\nwith facilities for running those works, provided that you comply with\nthe terms of this License in conveying all material for which you do\nnot control copyright.  Those thus making or running the covered works\nfor you must do so exclusively on your behalf, under your direction\nand control, on terms that prohibit them from making any copies of\nyour copyrighted material outside their relationship with you.\n\n  Conveying under any other circumstances is permitted solely under\nthe conditions stated below.  Sublicensing is not allowed; section 10\nmakes it unnecessary.\n\n  3. Protecting Users' Legal Rights From Anti-Circumvention Law.\n\n  No covered work shall be deemed part of an effective technological\nmeasure under any applicable law fulfilling obligations under article\n11 of the WIPO copyright treaty adopted on 20 December 1996, or\nsimilar laws prohibiting or restricting circumvention of such\nmeasures.\n\n  When you convey a covered work, you waive any legal power to forbid\ncircumvention of technological measures to the extent such circumvention\nis effected by exercising rights under this License with respect to\nthe covered work, and you disclaim any intention to limit operation or\nmodification of the work as a means of enforcing, against the work's\nusers, your or third parties' legal rights to forbid circumvention of\ntechnological measures.\n\n  4. Conveying Verbatim Copies.\n\n  You may convey verbatim copies of the Program's source code as you\nreceive it, in any medium, provided that you conspicuously and\nappropriately publish on each copy an appropriate copyright notice;\nkeep intact all notices stating that this License and any\nnon-permissive terms added in accord with section 7 apply to the code;\nkeep intact all notices of the absence of any warranty; and give all\nrecipients a copy of this License along with the Program.\n\n  You may charge any price or no price for each copy that you convey,\nand you may offer support or warranty protection for a fee.\n\n  5. Conveying Modified Source Versions.\n\n  You may convey a work based on the Program, or the modifications to\nproduce it from the Program, in the form of source code under the\nterms of section 4, provided that you also meet all of these conditions:\n\n    a) The work must carry prominent notices stating that you modified\n    it, and giving a relevant date.\n\n    b) The work must carry prominent notices stating that it is\n    released under this License and any conditions added under section\n    7.  This requirement modifies the requirement in section 4 to\n    \"keep intact all notices\".\n\n    c) You must license the entire work, as a whole, under this\n    License to anyone who comes into possession of a copy.  This\n    License will therefore apply, along with any applicable section 7\n    additional terms, to the whole of the work, and all its parts,\n    regardless of how they are packaged.  This License gives no\n    permission to license the work in any other way, but it does not\n    invalidate such permission if you have separately received it.\n\n    d) If the work has interactive user interfaces, each must display\n    Appropriate Legal Notices; however, if the Program has interactive\n    interfaces that do not display Appropriate Legal Notices, your\n    work need not make them do so.\n\n  A compilation of a covered work with other separate and independent\nworks, which are not by their nature extensions of the covered work,\nand which are not combined with it such as to form a larger program,\nin or on a volume of a storage or distribution medium, is called an\n\"aggregate\" if the compilation and its resulting copyright are not\nused to limit the access or legal rights of the compilation's users\nbeyond what the individual works permit.  Inclusion of a covered work\nin an aggregate does not cause this License to apply to the other\nparts of the aggregate.\n\n  6. Conveying Non-Source Forms.\n\n  You may convey a covered work in object code form under the terms\nof sections 4 and 5, provided that you also convey the\nmachine-readable Corresponding Source under the terms of this License,\nin one of these ways:\n\n    a) Convey the object code in, or embodied in, a physical product\n    (including a physical distribution medium), accompanied by the\n    Corresponding Source fixed on a durable physical medium\n    customarily used for software interchange.\n\n    b) Convey the object code in, or embodied in, a physical product\n    (including a physical distribution medium), accompanied by a\n    written offer, valid for at least three years and valid for as\n    long as you offer spare parts or customer support for that product\n    model, to give anyone who possesses the object code either (1) a\n    copy of the Corresponding Source for all the software in the\n    product that is covered by this License, on a durable physical\n    medium customarily used for software interchange, for a price no\n    more than your reasonable cost of physically performing this\n    conveying of source, or (2) access to copy the\n    Corresponding Source from a network server at no charge.\n\n    c) Convey individual copies of the object code with a copy of the\n    written offer to provide the Corresponding Source.  This\n    alternative is allowed only occasionally and noncommercially, and\n    only if you received the object code with such an offer, in accord\n    with subsection 6b.\n\n    d) Convey the object code by offering access from a designated\n    place (gratis or for a charge), and offer equivalent access to the\n    Corresponding Source in the same way through the same place at no\n    further charge.  You need not require recipients to copy the\n    Corresponding Source along with the object code.  If the place to\n    copy the object code is a network server, the Corresponding Source\n    may be on a different server (operated by you or a third party)\n    that supports equivalent copying facilities, provided you maintain\n    clear directions next to the object code saying where to find the\n    Corresponding Source.  Regardless of what server hosts the\n    Corresponding Source, you remain obligated to ensure that it is\n    available for as long as needed to satisfy these requirements.\n\n    e) Convey the object code using peer-to-peer transmission, provided\n    you inform other peers where the object code and Corresponding\n    Source of the work are being offered to the general public at no\n    charge under subsection 6d.\n\n  A separable portion of the object code, whose source code is excluded\nfrom the Corresponding Source as a System Library, need not be\nincluded in conveying the object code work.\n\n  A \"User Product\" is either (1) a \"consumer product\", which means any\ntangible personal property which is normally used for personal, family,\nor household purposes, or (2) anything designed or sold for incorporation\ninto a dwelling.  In determining whether a product is a consumer product,\ndoubtful cases shall be resolved in favor of coverage.  For a particular\nproduct received by a particular user, \"normally used\" refers to a\ntypical or common use of that class of product, regardless of the status\nof the particular user or of the way in which the particular user\nactually uses, or expects or is expected to use, the product.  A product\nis a consumer product regardless of whether the product has substantial\ncommercial, industrial or non-consumer uses, unless such uses represent\nthe only significant mode of use of the product.\n\n  \"Installation Information\" for a User Product means any methods,\nprocedures, authorization keys, or other information required to install\nand execute modified versions of a covered work in that User Product from\na modified version of its Corresponding Source.  The information must\nsuffice to ensure that the continued functioning of the modified object\ncode is in no case prevented or interfered with solely because\nmodification has been made.\n\n  If you convey an object code work under this section in, or with, or\nspecifically for use in, a User Product, and the conveying occurs as\npart of a transaction in which the right of possession and use of the\nUser Product is transferred to the recipient in perpetuity or for a\nfixed term (regardless of how the transaction is characterized), the\nCorresponding Source conveyed under this section must be accompanied\nby the Installation Information.  But this requirement does not apply\nif neither you nor any third party retains the ability to install\nmodified object code on the User Product (for example, the work has\nbeen installed in ROM).\n\n  The requirement to provide Installation Information does not include a\nrequirement to continue to provide support service, warranty, or updates\nfor a work that has been modified or installed by the recipient, or for\nthe User Product in which it has been modified or installed.  Access to a\nnetwork may be denied when the modification itself materially and\nadversely affects the operation of the network or violates the rules and\nprotocols for communication across the network.\n\n  Corresponding Source conveyed, and Installation Information provided,\nin accord with this section must be in a format that is publicly\ndocumented (and with an implementation available to the public in\nsource code form), and must require no special password or key for\nunpacking, reading or copying.\n\n  7. Additional Terms.\n\n  \"Additional permissions\" are terms that supplement the terms of this\nLicense by making exceptions from one or more of its conditions.\nAdditional permissions that are applicable to the entire Program shall\nbe treated as though they were included in this License, to the extent\nthat they are valid under applicable law.  If additional permissions\napply only to part of the Program, that part may be used separately\nunder those permissions, but the entire Program remains governed by\nthis License without regard to the additional permissions.\n\n  When you convey a copy of a covered work, you may at your option\nremove any additional permissions from that copy, or from any part of\nit.  (Additional permissions may be written to require their own\nremoval in certain cases when you modify the work.)  You may place\nadditional permissions on material, added by you to a covered work,\nfor which you have or can give appropriate copyright permission.\n\n  Notwithstanding any other provision of this License, for material you\nadd to a covered work, you may (if authorized by the copyright holders of\nthat material) supplement the terms of this License with terms:\n\n    a) Disclaiming warranty or limiting liability differently from the\n    terms of sections 15 and 16 of this License; or\n\n    b) Requiring preservation of specified reasonable legal notices or\n    author attributions in that material or in the Appropriate Legal\n    Notices displayed by works containing it; or\n\n    c) Prohibiting misrepresentation of the origin of that material, or\n    requiring that modified versions of such material be marked in\n    reasonable ways as different from the original version; or\n\n    d) Limiting the use for publicity purposes of names of licensors or\n    authors of the material; or\n\n    e) Declining to grant rights under trademark law for use of some\n    trade names, trademarks, or service marks; or\n\n    f) Requiring indemnification of licensors and authors of that\n    material by anyone who conveys the material (or modified versions of\n    it) with contractual assumptions of liability to the recipient, for\n    any liability that these contractual assumptions directly impose on\n    those licensors and authors.\n\n  All other non-permissive additional terms are considered \"further\nrestrictions\" within the meaning of section 10.  If the Program as you\nreceived it, or any part of it, contains a notice stating that it is\ngoverned by this License along with a term that is a further\nrestriction, you may remove that term.  If a license document contains\na further restriction but permits relicensing or conveying under this\nLicense, you may add to a covered work material governed by the terms\nof that license document, provided that the further restriction does\nnot survive such relicensing or conveying.\n\n  If you add terms to a covered work in accord with this section, you\nmust place, in the relevant source files, a statement of the\nadditional terms that apply to those files, or a notice indicating\nwhere to find the applicable terms.\n\n  Additional terms, permissive or non-permissive, may be stated in the\nform of a separately written license, or stated as exceptions;\nthe above requirements apply either way.\n\n  8. Termination.\n\n  You may not propagate or modify a covered work except as expressly\nprovided under this License.  Any attempt otherwise to propagate or\nmodify it is void, and will automatically terminate your rights under\nthis License (including any patent licenses granted under the third\nparagraph of section 11).\n\n  However, if you cease all violation of this License, then your\nlicense from a particular copyright holder is reinstated (a)\nprovisionally, unless and until the copyright holder explicitly and\nfinally terminates your license, and (b) permanently, if the copyright\nholder fails to notify you of the violation by some reasonable means\nprior to 60 days after the cessation.\n\n  Moreover, your license from a particular copyright holder is\nreinstated permanently if the copyright holder notifies you of the\nviolation by some reasonable means, this is the first time you have\nreceived notice of violation of this License (for any work) from that\ncopyright holder, and you cure the violation prior to 30 days after\nyour receipt of the notice.\n\n  Termination of your rights under this section does not terminate the\nlicenses of parties who have received copies or rights from you under\nthis License.  If your rights have been terminated and not permanently\nreinstated, you do not qualify to receive new licenses for the same\nmaterial under section 10.\n\n  9. Acceptance Not Required for Having Copies.\n\n  You are not required to accept this License in order to receive or\nrun a copy of the Program.  Ancillary propagation of a covered work\noccurring solely as a consequence of using peer-to-peer transmission\nto receive a copy likewise does not require acceptance.  However,\nnothing other than this License grants you permission to propagate or\nmodify any covered work.  These actions infringe copyright if you do\nnot accept this License.  Therefore, by modifying or propagating a\ncovered work, you indicate your acceptance of this License to do so.\n\n  10. Automatic Licensing of Downstream Recipients.\n\n  Each time you convey a covered work, the recipient automatically\nreceives a license from the original licensors, to run, modify and\npropagate that work, subject to this License.  You are not responsible\nfor enforcing compliance by third parties with this License.\n\n  An \"entity transaction\" is a transaction transferring control of an\norganization, or substantially all assets of one, or subdividing an\norganization, or merging organizations.  If propagation of a covered\nwork results from an entity transaction, each party to that\ntransaction who receives a copy of the work also receives whatever\nlicenses to the work the party's predecessor in interest had or could\ngive under the previous paragraph, plus a right to possession of the\nCorresponding Source of the work from the predecessor in interest, if\nthe predecessor has it or can get it with reasonable efforts.\n\n  You may not impose any further restrictions on the exercise of the\nrights granted or affirmed under this License.  For example, you may\nnot impose a license fee, royalty, or other charge for exercise of\nrights granted under this License, and you may not initiate litigation\n(including a cross-claim or counterclaim in a lawsuit) alleging that\nany patent claim is infringed by making, using, selling, offering for\nsale, or importing the Program or any portion of it.\n\n  11. Patents.\n\n  A \"contributor\" is a copyright holder who authorizes use under this\nLicense of the Program or a work on which the Program is based.  The\nwork thus licensed is called the contributor's \"contributor version\".\n\n  A contributor's \"essential patent claims\" are all patent claims\nowned or controlled by the contributor, whether already acquired or\nhereafter acquired, that would be infringed by some manner, permitted\nby this License, of making, using, or selling its contributor version,\nbut do not include claims that would be infringed only as a\nconsequence of further modification of the contributor version.  For\npurposes of this definition, \"control\" includes the right to grant\npatent sublicenses in a manner consistent with the requirements of\nthis License.\n\n  Each contributor grants you a non-exclusive, worldwide, royalty-free\npatent license under the contributor's essential patent claims, to\nmake, use, sell, offer for sale, import and otherwise run, modify and\npropagate the contents of its contributor version.\n\n  In the following three paragraphs, a \"patent license\" is any express\nagreement or commitment, however denominated, not to enforce a patent\n(such as an express permission to practice a patent or covenant not to\nsue for patent infringement).  To \"grant\" such a patent license to a\nparty means to make such an agreement or commitment not to enforce a\npatent against the party.\n\n  If you convey a covered work, knowingly relying on a patent license,\nand the Corresponding Source of the work is not available for anyone\nto copy, free of charge and under the terms of this License, through a\npublicly available network server or other readily accessible means,\nthen you must either (1) cause the Corresponding Source to be so\navailable, or (2) arrange to deprive yourself of the benefit of the\npatent license for this particular work, or (3) arrange, in a manner\nconsistent with the requirements of this License, to extend the patent\nlicense to downstream recipients.  \"Knowingly relying\" means you have\nactual knowledge that, but for the patent license, your conveying the\ncovered work in a country, or your recipient's use of the covered work\nin a country, would infringe one or more identifiable patents in that\ncountry that you have reason to believe are valid.\n\n  If, pursuant to or in connection with a single transaction or\narrangement, you convey, or propagate by procuring conveyance of, a\ncovered work, and grant a patent license to some of the parties\nreceiving the covered work authorizing them to use, propagate, modify\nor convey a specific copy of the covered work, then the patent license\nyou grant is automatically extended to all recipients of the covered\nwork and works based on it.\n\n  A patent license is \"discriminatory\" if it does not include within\nthe scope of its coverage, prohibits the exercise of, or is\nconditioned on the non-exercise of one or more of the rights that are\nspecifically granted under this License.  You may not convey a covered\nwork if you are a party to an arrangement with a third party that is\nin the business of distributing software, under which you make payment\nto the third party based on the extent of your activity of conveying\nthe work, and under which the third party grants, to any of the\nparties who would receive the covered work from you, a discriminatory\npatent license (a) in connection with copies of the covered work\nconveyed by you (or copies made from those copies), or (b) primarily\nfor and in connection with specific products or compilations that\ncontain the covered work, unless you entered into that arrangement,\nor that patent license was granted, prior to 28 March 2007.\n\n  Nothing in this License shall be construed as excluding or limiting\nany implied license or other defenses to infringement that may\notherwise be available to you under applicable patent law.\n\n  12. No Surrender of Others' Freedom.\n\n  If conditions are imposed on you (whether by court order, agreement or\notherwise) that contradict the conditions of this License, they do not\nexcuse you from the conditions of this License.  If you cannot convey a\ncovered work so as to satisfy simultaneously your obligations under this\nLicense and any other pertinent obligations, then as a consequence you may\nnot convey it at all.  For example, if you agree to terms that obligate you\nto collect a royalty for further conveying from those to whom you convey\nthe Program, the only way you could satisfy both those terms and this\nLicense would be to refrain entirely from conveying the Program.\n\n  13. Use with the GNU Affero General Public License.\n\n  Notwithstanding any other provision of this License, you have\npermission to link or combine any covered work with a work licensed\nunder version 3 of the GNU Affero General Public License into a single\ncombined work, and to convey the resulting work.  The terms of this\nLicense will continue to apply to the part which is the covered work,\nbut the special requirements of the GNU Affero General Public License,\nsection 13, concerning interaction through a network will apply to the\ncombination as such.\n\n  14. Revised Versions of this License.\n\n  The Free Software Foundation may publish revised and/or new versions of\nthe GNU General Public License from time to time.  Such new versions will\nbe similar in spirit to the present version, but may differ in detail to\naddress new problems or concerns.\n\n  Each version is given a distinguishing version number.  If the\nProgram specifies that a certain numbered version of the GNU General\nPublic License \"or any later version\" applies to it, you have the\noption of following the terms and conditions either of that numbered\nversion or of any later version published by the Free Software\nFoundation.  If the Program does not specify a version number of the\nGNU General Public License, you may choose any version ever published\nby the Free Software Foundation.\n\n  If the Program specifies that a proxy can decide which future\nversions of the GNU General Public License can be used, that proxy's\npublic statement of acceptance of a version permanently authorizes you\nto choose that version for the Program.\n\n  Later license versions may give you additional or different\npermissions.  However, no additional obligations are imposed on any\nauthor or copyright holder as a result of your choosing to follow a\nlater version.\n\n  15. Disclaimer of Warranty.\n\n  THERE IS NO WARRANTY FOR THE PROGRAM, TO THE EXTENT PERMITTED BY\nAPPLICABLE LAW.  EXCEPT WHEN OTHERWISE STATED IN WRITING THE COPYRIGHT\nHOLDERS AND/OR OTHER PARTIES PROVIDE THE PROGRAM \"AS IS\" WITHOUT WARRANTY\nOF ANY KIND, EITHER EXPRESSED OR IMPLIED, INCLUDING, BUT NOT LIMITED TO,\nTHE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR\nPURPOSE.  THE ENTIRE RISK AS TO THE QUALITY AND PERFORMANCE OF THE PROGRAM\nIS WITH YOU.  SHOULD THE PROGRAM PROVE DEFECTIVE, YOU ASSUME THE COST OF\nALL NECESSARY SERVICING, REPAIR OR CORRECTION.\n\n  16. Limitation of Liability.\n\n  IN NO EVENT UNLESS REQUIRED BY APPLICABLE LAW OR AGREED TO IN WRITING\nWILL ANY COPYRIGHT HOLDER, OR ANY OTHER PARTY WHO MODIFIES AND/OR CONVEYS\nTHE PROGRAM AS PERMITTED ABOVE, BE LIABLE TO YOU FOR DAMAGES, INCLUDING ANY\nGENERAL, SPECIAL, INCIDENTAL OR CONSEQUENTIAL DAMAGES ARISING OUT OF THE\nUSE OR INABILITY TO USE THE PROGRAM (INCLUDING BUT NOT LIMITED TO LOSS OF\nDATA OR DATA BEING RENDERED INACCURATE OR LOSSES SUSTAINED BY YOU OR THIRD\nPARTIES OR A FAILURE OF THE PROGRAM TO OPERATE WITH ANY OTHER PROGRAMS),\nEVEN IF SUCH HOLDER OR OTHER PARTY HAS BEEN ADVISED OF THE POSSIBILITY OF\nSUCH DAMAGES.\n\n  17. Interpretation of Sections 15 and 16.\n\n  If the disclaimer of warranty and limitation of liability provided\nabove cannot be given local legal effect according to their terms,\nreviewing courts shall apply local law that most closely approximates\nan absolute waiver of all civil liability in connection with the\nProgram, unless a warranty or assumption of liability accompanies a\ncopy of the Program in return for a fee.\n\n                     END OF TERMS AND CONDITIONS\n\n            How to Apply These Terms to Your New Programs\n\n  If you develop a new program, and you want it to be of the greatest\npossible use to the public, the best way to achieve this is to make it\nfree software which everyone can redistribute and change under these terms.\n\n  To do so, attach the following notices to the program.  It is safest\nto attach them to the start of each source file to most effectively\nstate the exclusion of warranty; and each file should have at least\nthe \"copyright\" line and a pointer to where the full notice is found.\n\n    <one line to give the program's name and a brief idea of what it does.>\n    Copyright (C) <year>  <name of author>\n\n    This program is free software: you can redistribute it and/or modify\n    it under the terms of the GNU General Public License as published by\n    the Free Software Foundation, either version 3 of the License, or\n    (at your option) any later version.\n\n    This program is distributed in the hope that it will be useful,\n    but WITHOUT ANY WARRANTY; without even the implied warranty of\n    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the\n    GNU General Public License for more details.\n\n    You should have received a copy of the GNU General Public License\n    along with this program.  If not, see <https://www.gnu.org/licenses/>.\n\nAlso add information on how to contact you by electronic and paper mail.\n\n  If the program does terminal interaction, make it output a short\nnotice like this when it starts in an interactive mode:\n\n    <program>  Copyright (C) <year>  <name of author>\n    This program comes with ABSOLUTELY NO WARRANTY; for details type `show w'.\n    This is free software, and you are welcome to redistribute it\n    under certain conditions; type `show c' for details.\n\nThe hypothetical commands `show w' and `show c' should show the appropriate\nparts of the General Public License.  Of course, your program's commands\nmight be different; for a GUI interface, you would use an \"about box\".\n\n  You should also get your employer (if you work as a programmer) or school,\nif any, to sign a \"copyright disclaimer\" for the program, if necessary.\nFor more information on this, and how to apply and follow the GNU GPL, see\n<https://www.gnu.org/licenses/>.\n\n  The GNU General Public License does not permit incorporating your program\ninto proprietary programs.  If your program is a subroutine library, you\nmay consider it more useful to permit linking proprietary applications with\nthe library.  If this is what you want to do, use the GNU Lesser General\nPublic License instead of this License.  But first, please read\n<https://www.gnu.org/licenses/why-not-lgpl.html>.\n"
+diff --git a/hub/route/cloudflare.go b/hub/route/cloudflare.go
+index d0a2cb7..81acd10 100644
+--- a/hub/route/cloudflare.go
++++ b/hub/route/cloudflare.go
+@@ -28,9 +28,9 @@ func cloudflareRouter(secret string) http.Handler {
+ 	r.Get("/", func(w http.ResponseWriter, req *http.Request) {
+ 		render.JSON(w, req, map[string]any{
+ 			"schemaVersion": cloudflaretest.SchemaVersion, "capability": cloudflaretest.Capability,
+-			"supported": true, "preferredDomains": cloudflaretest.PreferredDomains, "budgetBytes": cloudflaretest.BudgetBytes,
++			"supported": true, "preferredDomains": cloudflaretest.PreferredDomains(), "budgetBytes": cloudflaretest.BudgetBytes,
+ 			"dnsAliases": true, "fixedAddressFamily": true, "engineVersion": cloudflaretest.EngineVersion,
+-			"method": "verge-cfst-transfer-v1", "upstreamCommit": cloudflaretest.UpstreamCommit,
++			"method": cloudflaretest.Method, "domainOnly": true, "upstreamCommit": cloudflaretest.UpstreamCommit,
+ 		})
+ 	})
+ 	r.Post("/jobs", func(w http.ResponseWriter, req *http.Request) {
+diff --git a/hub/route/cloudflare_test.go b/hub/route/cloudflare_test.go
+index 30b1bdb..4de9eb3 100644
+--- a/hub/route/cloudflare_test.go
++++ b/hub/route/cloudflare_test.go
+@@ -32,7 +32,7 @@ func TestCloudflareRequiresNonemptySecretAndAuthentication(t *testing.T) {
+ 			if err := json.Unmarshal(w.Body.Bytes(), &capability); err != nil {
+ 				t.Fatal(err)
+ 			}
+-			if capability["schemaVersion"] != float64(1) || capability["capability"] != "verge-cloudflare1" || capability["supported"] != true {
++			if capability["schemaVersion"] != float64(1) || capability["capability"] != "verge-cloudflare1" || capability["supported"] != true || capability["engineVersion"] != "cf-speedtest2" || capability["method"] != "verge-cfst-transfer-v2" || capability["domainOnly"] != true {
+ 				t.Fatal(capability)
+ 			}
+ 		}

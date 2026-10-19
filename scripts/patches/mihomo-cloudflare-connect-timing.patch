@@ -1,0 +1,731 @@
+diff --git a/component/cloudflaretest/engine.go b/component/cloudflaretest/engine.go
+index 307cb94..ffeb3ab 100644
+--- a/component/cloudflaretest/engine.go
++++ b/component/cloudflaretest/engine.go
+@@ -32,7 +32,7 @@ type job struct {
+ 	url      *url.URL
+ 	path     physicalPath
+ 	lookup   func(context.Context, string, bool) ([]netip.Addr, error)
+-	dial     func(context.Context, netip.Addr) (net.Conn, error)
++	dial     func(context.Context, netip.Addr) (net.Conn, time.Duration, error)
+ 	allowed  map[netip.Addr]bool
+ }
+ 
+@@ -78,7 +78,7 @@ func (m *Manager) Start(options Options) (Snapshot, error) {
+ 		return r.LookupIPv4(ctx, host)
+ 	}
+ 	j.dial = path.dial
+-	j.snapshot = Snapshot{SchemaVersion: SchemaVersion, Capability: Capability, RunID: hex.EncodeToString(id), Revision: 1, State: "running", Stage: "resolving", InterfaceName: path.name, DNSMode: dnsMode, URL: u.Scheme + "://" + u.Host + "/…", StartedAt: time.Now().UTC().Format(time.RFC3339Nano), BudgetBytes: BudgetBytes, Results: []Result{}, Sources: []Source{}}
++	j.snapshot = Snapshot{SchemaVersion: SchemaVersion, Capability: Capability, LatencyMethod: LatencyMethod, RunID: hex.EncodeToString(id), Revision: 1, State: "running", Stage: "resolving", InterfaceName: path.name, DNSMode: dnsMode, URL: u.Scheme + "://" + u.Host + "/…", StartedAt: time.Now().UTC().Format(time.RFC3339Nano), BudgetBytes: BudgetBytes, Results: []Result{}, Sources: []Source{}}
+ 	for _, domain := range PreferredDomains() {
+ 		j.snapshot.Sources = append(j.snapshot.Sources, Source{Name: domain, IPs: []string{}, State: "pending"})
+ 	}
+@@ -372,9 +372,16 @@ func (j *job) resolveCandidates() ([]Result, []Source) {
+ 	return results, sources
+ }
+ 
+-func (j *job) dialCandidate(ctx context.Context, ip netip.Addr) (net.Conn, error) {
++func (j *job) dialCandidate(ctx context.Context, ip netip.Addr) (net.Conn, time.Duration, error) {
+ 	if ip.Zone() != "" || !publicIP(ip) || !j.allowed[ip] {
+-		return nil, errors.New("candidate is outside this benchmark's frozen domain answers")
++		return nil, 0, errors.New("candidate is outside this benchmark's frozen domain answers")
+ 	}
+-	return j.dial(ctx, ip)
++	conn, elapsed, err := j.dial(ctx, ip)
++	if ctx.Err() != nil {
++		if conn != nil {
++			conn.Close()
++		}
++		return nil, elapsed, ctx.Err()
++	}
++	return conn, elapsed, err
+ }
+diff --git a/component/cloudflaretest/engine_test.go b/component/cloudflaretest/engine_test.go
+index b3236c3..a50fc7d 100644
+--- a/component/cloudflaretest/engine_test.go
++++ b/component/cloudflaretest/engine_test.go
+@@ -22,6 +22,8 @@ import (
+ 	"sync/atomic"
+ 	"testing"
+ 	"time"
++
++	"github.com/metacubex/mihomo/component/dialer"
+ )
+ 
+ func TestProductionDownloadAccountsTwoHTTPSPasses(t *testing.T) {
+@@ -138,11 +140,11 @@ func TestProductionDownloadAccountsTwoHTTPSPasses(t *testing.T) {
+ 		u, _ := url.Parse("https://example.com" + path + "?token=private-token")
+ 		latency, stability := 10.0, 1.0
+ 		j := &job{ctx: context.Background(), url: u, allowed: map[netip.Addr]bool{candidate: true}, snapshot: Snapshot{State: "running", Results: []Result{{IP: candidate.String(), State: "screened", LatencyMs: &latency, Stability: &stability}}}}
+-		j.dial = func(ctx context.Context, ip netip.Addr) (net.Conn, error) {
++		j.dial = func(ctx context.Context, ip netip.Addr) (net.Conn, time.Duration, error) {
+ 			if ip != candidate {
+ 				t.Errorf("candidate changed: %s", ip)
+ 			}
+-			return (&net.Dialer{}).DialContext(ctx, "tcp", server.Listener.Addr().String())
++			return dialer.DialContextWithIPMeasured(ctx, "tcp", netip.MustParseAddrPort(server.Listener.Addr().String()), 3*time.Second)
+ 		}
+ 		return j
+ 	}
+@@ -234,8 +236,8 @@ func TestProductionDownloadAccountsTwoHTTPSPasses(t *testing.T) {
+ 		j.lookup = func(context.Context, string, bool) ([]netip.Addr, error) {
+ 			return []netip.Addr{candidate, netip.MustParseAddr("8.8.8.8")}, nil
+ 		}
+-		j.dial = func(ctx context.Context, _ netip.Addr) (net.Conn, error) {
+-			return (&net.Dialer{}).DialContext(ctx, "tcp", server.Listener.Addr().String())
++		j.dial = func(ctx context.Context, _ netip.Addr) (net.Conn, time.Duration, error) {
++			return dialer.DialContextWithIPMeasured(ctx, "tcp", netip.MustParseAddrPort(server.Listener.Addr().String()), 3*time.Second)
+ 		}
+ 		before := requests.Load()
+ 		j.run()
+@@ -286,13 +288,16 @@ func TestInputAndDomainCandidates(t *testing.T) {
+ 	}
+ 	j.allowed = map[netip.Addr]bool{netip.MustParseAddr(results[0].IP): true}
+ 	var dials int
+-	j.dial = func(context.Context, netip.Addr) (net.Conn, error) { dials++; return nil, errors.New("unused") }
++	j.dial = func(context.Context, netip.Addr) (net.Conn, time.Duration, error) {
++		dials++
++		return nil, 0, errors.New("unused")
++	}
+ 	for _, raw := range []string{"9.9.9.9", "127.0.0.1", "198.18.0.1"} {
+ 		ip := netip.MustParseAddr(raw)
+ 		if !publicIP(ip) {
+ 			j.allowed[ip] = true
+ 		}
+-		if _, err := j.dialCandidate(context.Background(), ip); err == nil {
++		if _, _, err := j.dialCandidate(context.Background(), ip); err == nil {
+ 			t.Fatal("unsafe candidate accepted")
+ 		}
+ 	}
+@@ -333,11 +338,11 @@ func TestForcedCandidateHostSNIAndResponseValidation(t *testing.T) {
+ 	}))
+ 	defer server.Close()
+ 	u, _ := url.Parse("https://example.com/body?secret=not-in-errors")
+-	j := &job{url: u, allowed: map[netip.Addr]bool{netip.MustParseAddr("104.16.0.1"): true}, dial: func(ctx context.Context, ip netip.Addr) (net.Conn, error) {
++	j := &job{url: u, allowed: map[netip.Addr]bool{netip.MustParseAddr("104.16.0.1"): true}, dial: func(ctx context.Context, ip netip.Addr) (net.Conn, time.Duration, error) {
+ 		if ip.String() != "104.16.0.1" {
+ 			t.Errorf("wrong forced candidate %s", ip)
+ 		}
+-		return (&net.Dialer{}).DialContext(ctx, "tcp", server.Listener.Addr().String())
++		return dialer.DialContextWithIPMeasured(ctx, "tcp", netip.MustParseAddrPort(server.Listener.Addr().String()), 3*time.Second)
+ 	}}
+ 	client := j.client(netip.MustParseAddr("104.16.0.1"))
+ 	transport := client.Transport.(*http.Transport)
+diff --git a/component/cloudflaretest/measure.go b/component/cloudflaretest/measure.go
+index dc7c67f..4b7615b 100644
+--- a/component/cloudflaretest/measure.go
++++ b/component/cloudflaretest/measure.go
+@@ -33,7 +33,7 @@ func (j *job) client(ip netip.Addr) *http.Client {
+ 			TLSHandshakeTimeout: 3 * time.Second, ResponseHeaderTimeout: 3 * time.Second,
+ 			MaxResponseHeaderBytes: 32 * 1024,
+ 			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+-				conn, err := j.dialCandidate(ctx, ip)
++				conn, _, err := j.dialCandidate(ctx, ip)
+ 				if err != nil {
+ 					return nil, &requestError{&Diagnostic{Stage: "tcp", Code: "tcp_failed"}}
+ 				}
+@@ -168,17 +168,14 @@ func (j *job) screen(r Result) Result {
+ 			break
+ 		}
+ 		r.Attempts++
+-		ctx, cancel := context.WithTimeout(j.ctx, 3*time.Second)
+-		start := time.Now()
+-		conn, err := j.dialCandidate(ctx, ip)
+-		latency := float64(time.Since(start)) / float64(time.Millisecond)
++		conn, elapsed, err := j.dialCandidate(j.ctx, ip)
++		latency := float64(elapsed) / float64(time.Millisecond)
+ 		if err == nil {
+ 			conn.Close()
+ 			latencies = append(latencies, latency)
+ 		} else {
+ 			r.Failures++
+ 		}
+-		cancel()
+ 	}
+ 	if len(latencies) == 0 {
+ 		r.State, r.Error = "failed", "tcp_failed"
+diff --git a/component/cloudflaretest/network.go b/component/cloudflaretest/network.go
+index 09999cb..60068ac 100644
+--- a/component/cloudflaretest/network.go
++++ b/component/cloudflaretest/network.go
+@@ -161,36 +161,62 @@ func (p physicalPath) verify(ctx context.Context) error {
+ 	return nil
+ }
+ 
+-func (p physicalPath) dial(ctx context.Context, ip netip.Addr) (net.Conn, error) {
++func (p physicalPath) dial(ctx context.Context, ip netip.Addr) (net.Conn, time.Duration, error) {
+ 	if !publicIP(ip) {
+-		return nil, errors.New("candidate is not a public address")
+-	}
+-	if err := p.verify(ctx); err != nil {
+-		return nil, err
++		return nil, 0, errors.New("candidate is not a public address")
+ 	}
+ 	if ip.Is6() && !p.ipv6 {
+-		return nil, errors.New("IPv6 is not available on the physical interface")
++		return nil, 0, errors.New("IPv6 is not available on the physical interface")
+ 	}
+-	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+-	defer cancel()
+-	conn, err := dialer.DialContextWithIP(ctx, "tcp", netip.AddrPortFrom(ip, 443), dialer.WithInterface(p.name))
+-	if err != nil {
+-		return nil, errors.New("candidate connection or physical interface binding failed")
++	return dialVerifiedIP(ctx, netip.AddrPortFrom(ip, 443), p.verifyConnection, func() []dialer.Option {
++		return []dialer.Option{dialer.WithInterface(p.name)}
++	})
++}
++
++func (p physicalPath) verifyConnection(ctx context.Context, conn net.Conn) error {
++	if err := p.verify(ctx); err != nil {
++		return err
++	}
++	if conn == nil {
++		return nil
+ 	}
+ 	local, _, err := net.SplitHostPort(conn.LocalAddr().String())
+ 	if err != nil {
+-		conn.Close()
+-		return nil, errors.New("cannot verify bound local address")
++		return errors.New("cannot verify bound local address")
+ 	}
+ 	_, addrs, err := physicalInterface(p.name)
+ 	if err == nil {
+ 		for _, addr := range addrs {
+ 			prefix, err := netip.ParsePrefix(addr.String())
+ 			if err == nil && prefix.Addr().String() == local {
+-				return conn, nil
++				return nil
+ 			}
+ 		}
+ 	}
+-	conn.Close()
+-	return nil, errors.New("connection did not use the selected physical interface")
++	return errors.New("connection did not use the selected physical interface")
++}
++
++func dialVerifiedIP(ctx context.Context, destination netip.AddrPort, verify func(context.Context, net.Conn) error, options func() []dialer.Option) (net.Conn, time.Duration, error) {
++	if err := ctx.Err(); err != nil {
++		return nil, 0, err
++	}
++	if err := verify(ctx, nil); err != nil {
++		return nil, 0, err
++	}
++	if err := ctx.Err(); err != nil {
++		return nil, 0, err
++	}
++	conn, elapsed, err := dialer.DialContextWithIPMeasured(ctx, "tcp", destination, 3*time.Second, options()...)
++	if err != nil {
++		return nil, elapsed, errors.New("candidate connection or physical interface binding failed")
++	}
++	err = verify(ctx, conn)
++	if ctx.Err() != nil {
++		err = ctx.Err()
++	}
++	if err != nil {
++		conn.Close()
++		return nil, elapsed, err
++	}
++	return conn, elapsed, nil
+ }
+diff --git a/component/cloudflaretest/network_timing_test.go b/component/cloudflaretest/network_timing_test.go
+new file mode 100644
+index 0000000..ffb9993
+--- /dev/null
++++ b/component/cloudflaretest/network_timing_test.go
+@@ -0,0 +1,129 @@
++package cloudflaretest
++
++import (
++	"context"
++	"errors"
++	"io"
++	"math"
++	"net"
++	"net/netip"
++	"syscall"
++	"testing"
++	"time"
++
++	"github.com/metacubex/mihomo/component/dialer"
++)
++
++func TestScreenUsesRealConnectDurationOutsidePhysicalMetadata(t *testing.T) {
++	listener, err := net.Listen("tcp4", "127.0.0.1:0")
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer listener.Close()
++	go func() {
++		for {
++			conn, err := listener.Accept()
++			if err != nil {
++				return
++			}
++			conn.Close()
++		}
++	}()
++	candidate := netip.MustParseAddr("1.1.1.1")
++	destination := netip.MustParseAddrPort(listener.Addr().String())
++	j := &job{ctx: context.Background(), allowed: map[netip.Addr]bool{candidate: true}}
++	var measured []float64
++	checks := 0
++	j.dial = func(ctx context.Context, ip netip.Addr) (net.Conn, time.Duration, error) {
++		if ip != candidate {
++			t.Fatal("candidate identity changed")
++		}
++		verify := func(ctx context.Context, conn net.Conn) error {
++			checks++
++			if checks == 1 {
++				time.Sleep(3100 * time.Millisecond)
++			} else {
++				time.Sleep(40 * time.Millisecond)
++			}
++			return ctx.Err()
++		}
++		native := &net.Dialer{ControlContext: func(ctx context.Context, _, _ string, _ syscall.RawConn) error {
++			time.Sleep(30 * time.Millisecond)
++			return ctx.Err()
++		}}
++		conn, elapsed, err := dialVerifiedIP(ctx, destination, verify, func() []dialer.Option {
++			time.Sleep(100 * time.Millisecond)
++			return []dialer.Option{dialer.WithNetDialer(native)}
++		})
++		if err == nil {
++			measured = append(measured, float64(elapsed)/float64(time.Millisecond))
++		}
++		return conn, elapsed, err
++	}
++	start := time.Now()
++	result := j.screen(Result{IP: candidate.String(), State: "pending"})
++	total := time.Since(start)
++	if result.State != "screened" || result.Attempts != 4 || result.Failures != 0 || checks != 8 || result.LatencyMs == nil || math.Abs(*result.LatencyMs-average(measured)) > 1e-9 {
++		t.Fatalf("screen did not use exact real socket measurements: %+v measured=%v checks=%d", result, measured, checks)
++	}
++	if *result.LatencyMs < 30 || *result.LatencyMs >= 150 || total < 3*time.Second {
++		t.Fatalf("metadata leaked into timing or socket control omitted: connect=%v total=%v", *result.LatencyMs, total)
++	}
++	t.Logf("screen real loopback: average connect=%vms wall=%v; not physical binding proof", *result.LatencyMs, total)
++}
++
++func TestVerifiedConnectRejectsFailuresAndParentCancellation(t *testing.T) {
++	for _, stage := range []string{"pre-failure", "pre-cancel", "prepare-cancel", "post-failure", "post-cancel"} {
++		t.Run(stage, func(t *testing.T) {
++			listener, err := net.Listen("tcp4", "127.0.0.1:0")
++			if err != nil {
++				t.Fatal(err)
++			}
++			defer listener.Close()
++			accepted := make(chan net.Conn, 1)
++			go func() {
++				conn, err := listener.Accept()
++				if err == nil {
++					accepted <- conn
++				}
++			}()
++			ctx, cancel := context.WithCancel(context.Background())
++			defer cancel()
++			failure := errors.New("fixture interface changed")
++			verify := func(_ context.Context, conn net.Conn) error {
++				if conn == nil && stage == "pre-failure" || conn != nil && stage == "post-failure" {
++					return failure
++				}
++				if conn == nil && stage == "pre-cancel" || conn != nil && stage == "post-cancel" {
++					cancel()
++				}
++				return nil
++			}
++			options := func() []dialer.Option {
++				if stage == "prepare-cancel" {
++					cancel()
++				}
++				return nil
++			}
++			conn, elapsed, err := dialVerifiedIP(ctx, netip.MustParseAddrPort(listener.Addr().String()), verify, options)
++			if err == nil || conn != nil {
++				t.Fatalf("rejected sample returned a connection: %v %v", conn, err)
++			}
++			if stage == "post-failure" || stage == "post-cancel" {
++				select {
++				case server := <-accepted:
++					defer server.Close()
++					server.SetReadDeadline(time.Now().Add(time.Second))
++					_, err := server.Read(make([]byte, 1))
++					if err != io.EOF || elapsed <= 0 {
++						t.Fatalf("post verification rejection leaked socket: %v connect=%v", err, elapsed)
++					}
++				case <-time.After(time.Second):
++					t.Fatal("real loopback connection was not accepted")
++				}
++			} else if elapsed != 0 {
++				t.Fatalf("preparation failure counted as connect: %v", elapsed)
++			}
++		})
++	}
++}
+diff --git a/component/cloudflaretest/types.go b/component/cloudflaretest/types.go
+index 91260de..ecd03d9 100644
+--- a/component/cloudflaretest/types.go
++++ b/component/cloudflaretest/types.go
+@@ -12,6 +12,7 @@ const (
+ 	Capability            = "verge-cloudflare1"
+ 	EngineVersion         = "cf-speedtest2"
+ 	Method                = "verge-cfst-transfer-v2"
++	LatencyMethod         = "tcp-connect"
+ 	UpstreamCommit        = "50b42c7f95cfb06413740ce6e1967578ebe63380"
+ 	BudgetBytes    uint64 = 256 * 1024 * 1024
+ )
+@@ -39,6 +40,7 @@ type Diagnostic struct {
+ type Snapshot struct {
+ 	SchemaVersion    int         `json:"schemaVersion"`
+ 	Capability       string      `json:"capability"`
++	LatencyMethod    string      `json:"latencyMethod"`
+ 	RunID            string      `json:"runId"`
+ 	Revision         uint64      `json:"revision"`
+ 	State            string      `json:"state"`
+diff --git a/component/dialer/dialer.go b/component/dialer/dialer.go
+index 6f10e9a..527f06b 100644
+--- a/component/dialer/dialer.go
++++ b/component/dialer/dialer.go
+@@ -56,6 +56,50 @@ func DialContextWithIP(ctx context.Context, network string, destination netip.Ad
+ 	return dialContext(ctx, network, ip, fmt.Sprint(destination.Port()), opt)
+ }
+ 
++// DialContextWithIPMeasured measures only the prepared socket connect, including socket controls.
++// Unlike ordinary dialing it cannot use address remapping, custom dialers, TFO or MPTCP.
++func DialContextWithIPMeasured(ctx context.Context, network string, destination netip.AddrPort, connectTimeout time.Duration, options ...Option) (net.Conn, time.Duration, error) {
++	if !destination.IsValid() || destination.Port() == 0 || destination.Addr().Zone() != "" {
++		return nil, 0, errors.New("invalid resolved destination")
++	}
++	ip := destination.Addr().Unmap()
++	if network != "tcp4" && network != "tcp6" && network != "tcp" {
++		return nil, 0, ErrorInvalidedNetworkStack
++	}
++	opt := applyOptions(options...)
++	if (network == "tcp4" && !ip.Is4()) || (network == "tcp6" && !ip.Is6()) || (opt.network == 4 && !ip.Is4()) || (opt.network == 6 && !ip.Is6()) {
++		return nil, 0, resolver.ErrIPVersion
++	}
++	if opt.tfo || opt.mpTcp {
++		return nil, 0, errors.New("measured connect does not support TFO or MPTCP")
++	}
++	if opt.netDialer != nil {
++		if _, ok := opt.netDialer.(*net.Dialer); !ok {
++			return nil, 0, errors.New("measured connect requires a native net.Dialer")
++		}
++	}
++	dialer, err := prepareNetDialer(network, ip, opt)
++	if err != nil {
++		return nil, 0, err
++	}
++	if err := ctx.Err(); err != nil {
++		return nil, 0, err
++	}
++	ctx, cancel := context.WithTimeout(ctx, connectTimeout)
++	defer cancel()
++	address := netip.AddrPortFrom(ip, destination.Port()).String()
++	start := time.Now()
++	conn, err := dialer.DialContext(ctx, network, address)
++	elapsed := time.Since(start)
++	if ctx.Err() != nil {
++		if conn != nil {
++			conn.Close()
++		}
++		return nil, elapsed, ctx.Err()
++	}
++	return conn, elapsed, err
++}
++
+ func DialContext(ctx context.Context, network, address string, options ...Option) (net.Conn, error) {
+ 	opt := applyOptions(options...)
+ 
+@@ -161,18 +205,27 @@ func dialContext(ctx context.Context, network string, destination netip.Addr, po
+ 	destination, port = resolver.LookupIP4P(destination, port)
+ 	address = net.JoinHostPort(destination.String(), port)
+ 
+-	netDialer := opt.netDialer
+-	switch netDialer.(type) {
+-	case nil:
+-		netDialer = &net.Dialer{}
+-	case *net.Dialer:
+-		_netDialer := *netDialer.(*net.Dialer)
+-		netDialer = &_netDialer // make a copy
+-	default:
+-		return netDialer.DialContext(ctx, network, address)
++	if opt.netDialer != nil {
++		if _, ok := opt.netDialer.(*net.Dialer); !ok {
++			return opt.netDialer.DialContext(ctx, network, address)
++		}
++	}
++	dialer, err := prepareNetDialer(network, destination, opt)
++	if err != nil {
++		return nil, err
+ 	}
++	if DefaultSocketHook == nil && opt.tfo && !DisableTFO {
++		return dialTFO(ctx, *dialer, network, address)
++	}
++	return dialer.DialContext(ctx, network, address)
++}
+ 
+-	dialer := netDialer.(*net.Dialer)
++func prepareNetDialer(network string, destination netip.Addr, opt option) (*net.Dialer, error) {
++	dialer := &net.Dialer{}
++	if opt.netDialer != nil {
++		copy := *opt.netDialer.(*net.Dialer)
++		dialer = &copy
++	}
+ 	keepalive.SetNetDialer(dialer)
+ 	mptcp.SetNetDialer(dialer, opt.mpTcp)
+ 
+@@ -202,12 +255,9 @@ func dialContext(ctx context.Context, network string, destination netip.Addr, po
+ 		if opt.routingMark != 0 {
+ 			bindMarkToDialer(opt.routingMark, dialer, network, destination)
+ 		}
+-		if opt.tfo && !DisableTFO {
+-			return dialTFO(ctx, *dialer, network, address)
+-		}
+ 	}
+ 
+-	return dialer.DialContext(ctx, network, address)
++	return dialer, nil
+ }
+ 
+ func ICMPControl(destination netip.Addr) func(network, address string, conn syscall.RawConn) error {
+diff --git a/component/dialer/measured_test.go b/component/dialer/measured_test.go
+new file mode 100644
+index 0000000..137919d
+--- /dev/null
++++ b/component/dialer/measured_test.go
+@@ -0,0 +1,119 @@
++package dialer
++
++import (
++	"context"
++	"errors"
++	"net"
++	"net/netip"
++	"syscall"
++	"testing"
++	"time"
++
++	"github.com/metacubex/mihomo/component/resolver"
++	"github.com/metacubex/mihomo/component/trie"
++)
++
++func TestMeasuredConnectIncludesSocketControlNotPreparation(t *testing.T) {
++	listener, err := net.Listen("tcp4", "127.0.0.1:0")
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer listener.Close()
++	destination := netip.MustParseAddrPort(listener.Addr().String())
++	oldHosts := resolver.DefaultHosts
++	defer func() { resolver.DefaultHosts = oldHosts }()
++	hosts := trie.New[resolver.HostValue]()
++	if err := hosts.Insert("127.0.0.1", resolver.HostValue{IPs: []netip.Addr{netip.MustParseAddr("127.0.0.2")}}); err != nil {
++		t.Fatal(err)
++	}
++	resolver.DefaultHosts = resolver.NewHosts(hosts)
++	const preparation = 150 * time.Millisecond
++	const socketDelay = 60 * time.Millisecond
++	controls := 0
++	native := &net.Dialer{LocalAddr: &net.TCPAddr{IP: net.ParseIP("127.0.0.1")}, ControlContext: func(ctx context.Context, network, address string, _ syscall.RawConn) error {
++		controls++
++		if network != "tcp4" || address != destination.String() {
++			t.Errorf("literal destination changed: %s %s", network, address)
++		}
++		time.Sleep(socketDelay)
++		return ctx.Err()
++	}}
++	start := time.Now()
++	conn, elapsed, err := DialContextWithIPMeasured(context.Background(), "tcp4", destination, time.Second, func(opt *option) { time.Sleep(preparation) }, WithNetDialer(native), WithOnlySingleStack(true))
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer conn.Close()
++	if controls != 1 || elapsed < socketDelay || time.Since(start)-elapsed < preparation || elapsed >= preparation {
++		t.Fatalf("wrong clock boundary: controls=%d elapsed=%v total=%v", controls, elapsed, time.Since(start))
++	}
++	if conn.RemoteAddr().String() != destination.String() || native.KeepAliveConfig.Enable {
++		t.Fatal("destination changed or supplied net.Dialer was mutated")
++	}
++	t.Logf("real loopback connect (not physical binding proof): connect=%v total=%v", elapsed, time.Since(start))
++}
++
++func TestMeasuredConnectRejectsUnsupportedModesAndPreservesLiteralIP4P(t *testing.T) {
++	destination := netip.MustParseAddrPort("127.0.0.1:443")
++	custom := NetDialerFunc(func(context.Context, string, string) (net.Conn, error) {
++		t.Fatal("custom dialer bypassed native binding")
++		return nil, nil
++	})
++	for _, options := range [][]Option{{WithNetDialer(custom)}, {WithTFO(true)}, {WithMPTCP(true)}, {WithOnlySingleStack(false)}} {
++		conn, elapsed, err := DialContextWithIPMeasured(context.Background(), "tcp", destination, time.Second, options...)
++		if err == nil || conn != nil || elapsed != 0 {
++			t.Fatalf("unsupported mode reached connect: %v %v", elapsed, err)
++		}
++	}
++	old := resolver.GetIP4PEnable()
++	resolver.SetIP4PEnable(true)
++	defer resolver.SetIP4PEnable(old)
++	literal := netip.MustParseAddrPort("[2001::1bb:7f00:1]:443")
++	stop := errors.New("stop before any outbound connect")
++	called := false
++	native := &net.Dialer{ControlContext: func(_ context.Context, network, address string, _ syscall.RawConn) error {
++		called = true
++		if network != "tcp6" || address != literal.String() {
++			t.Errorf("IP4P remapped measured literal: %s %s", network, address)
++		}
++		return stop
++	}}
++	_, _, err := DialContextWithIPMeasured(context.Background(), "tcp6", literal, time.Second, WithNetDialer(native))
++	if !called {
++		t.Skipf("IPv6 socket unavailable before control: %v", err)
++	}
++	if !errors.Is(err, stop) {
++		t.Fatal(err)
++	}
++}
++
++func TestMeasuredConnectDeadlineStartsAfterPreparation(t *testing.T) {
++	listener, err := net.Listen("tcp4", "127.0.0.1:0")
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer listener.Close()
++	destination := netip.MustParseAddrPort(listener.Addr().String())
++	conn, _, err := DialContextWithIPMeasured(context.Background(), "tcp4", destination, 40*time.Millisecond, func(*option) { time.Sleep(100 * time.Millisecond) })
++	if err != nil {
++		t.Fatalf("preparation consumed connect deadline: %v", err)
++	}
++	conn.Close()
++	for _, parentEarlier := range []bool{false, true} {
++		ctx := context.Background()
++		cancel := func() {}
++		if parentEarlier {
++			ctx, cancel = context.WithTimeout(ctx, 20*time.Millisecond)
++		}
++		start := time.Now()
++		native := &net.Dialer{ControlContext: func(ctx context.Context, _, _ string, _ syscall.RawConn) error { <-ctx.Done(); return ctx.Err() }}
++		conn, elapsed, err := DialContextWithIPMeasured(ctx, "tcp4", destination, 100*time.Millisecond, WithNetDialer(native))
++		cancel()
++		if conn != nil || !errors.Is(err, context.DeadlineExceeded) || elapsed <= 0 || time.Since(start) > time.Second {
++			t.Fatalf("deadline not honored: parent=%v connect=%v err=%v", parentEarlier, elapsed, err)
++		}
++		if parentEarlier && elapsed >= 90*time.Millisecond {
++			t.Fatalf("earlier parent deadline extended: %v", elapsed)
++		}
++	}
++}
+diff --git a/component/dialer/measured_windows_test.go b/component/dialer/measured_windows_test.go
+new file mode 100644
+index 0000000..bdc0913
+--- /dev/null
++++ b/component/dialer/measured_windows_test.go
+@@ -0,0 +1,84 @@
++package dialer
++
++import (
++	"context"
++	"net"
++	"net/netip"
++	"strings"
++	"syscall"
++	"testing"
++	"time"
++)
++
++func TestMeasuredConnectWindowsPrivateNICBinding(t *testing.T) {
++	interfaces, err := net.Interfaces()
++	if err != nil {
++		t.Skipf("private NIC enumeration unavailable: %v", err)
++	}
++	for _, iface := range interfaces {
++		if iface.Flags&net.FlagUp == 0 || iface.Flags&(net.FlagLoopback|net.FlagPointToPoint) != 0 || len(iface.HardwareAddr) < 6 {
++			continue
++		}
++		lower := strings.ToLower(iface.Name)
++		if strings.Contains(lower, "loopback") || strings.HasPrefix(lower, "tun") || strings.HasPrefix(lower, "clash") || strings.HasPrefix(lower, "mihomo") || strings.HasPrefix(lower, "verge") {
++			continue
++		}
++		addrs, err := iface.Addrs()
++		if err != nil {
++			continue
++		}
++		for _, addr := range addrs {
++			prefix, err := netip.ParsePrefix(addr.String())
++			if err != nil || !prefix.Addr().Is4() || !prefix.Addr().IsPrivate() {
++				continue
++			}
++			listener, err := net.Listen("tcp4", net.JoinHostPort(prefix.Addr().String(), "0"))
++			if err != nil {
++				t.Logf("private NIC listener unavailable on %s: %v", iface.Name, err)
++				continue
++			}
++			defer listener.Close()
++			accepted := make(chan net.Conn, 1)
++			go func() {
++				conn, err := listener.Accept()
++				if err == nil {
++					accepted <- conn
++				}
++			}()
++			destination := netip.MustParseAddrPort(listener.Addr().String())
++			start := time.Now()
++			conn, elapsed, err := DialContextWithIPMeasured(context.Background(), "tcp4", destination, time.Second, WithInterface(iface.Name))
++			if err != nil {
++				t.Fatalf("RFC1918 native interface-bound socket failed on %s (index %d): %v", iface.Name, iface.Index, err)
++			}
++			defer conn.Close()
++			if conn.LocalAddr().(*net.TCPAddr).AddrPort().Addr() != prefix.Addr() || conn.RemoteAddr().String() != destination.String() || elapsed <= 0 {
++				t.Fatalf("private bound socket addresses changed: local=%v remote=%v connect=%v", conn.LocalAddr(), conn.RemoteAddr(), elapsed)
++			}
++			raw, err := conn.(*net.TCPConn).SyscallConn()
++			if err != nil {
++				t.Fatal(err)
++			}
++			var value int
++			var socketErr error
++			if err := raw.Control(func(fd uintptr) {
++				value, socketErr = syscall.GetsockoptInt(syscall.Handle(fd), syscall.IPPROTO_IP, IP_UNICAST_IF)
++			}); err != nil || socketErr != nil {
++				t.Fatalf("cannot read actual IP_UNICAST_IF: %v %v", err, socketErr)
++			}
++			// IP_UNICAST_IF takes network byte order on set, but returns host byte order on get.
++			if value != iface.Index {
++				t.Fatalf("native binding bypassed: IP_UNICAST_IF=%d want index=%d", value, iface.Index)
++			}
++			select {
++			case server := <-accepted:
++				server.Close()
++			case <-time.After(time.Second):
++				t.Fatal("bound connection never reached private NIC listener")
++			}
++			t.Logf("real Windows RFC1918 socket binding verified: interface=%s index=%d IP_UNICAST_IF=%d local=%v destination=%v connect=%v total=%v; no Internet request", iface.Name, iface.Index, value, conn.LocalAddr(), destination, elapsed, time.Since(start))
++			return
++		}
++	}
++	t.Skip("no available up RFC1918 NIC/listener; loopback timing is not physical interface binding evidence")
++}
+diff --git a/hub/route/cloudflare.go b/hub/route/cloudflare.go
+index 81acd10..2a0c8c5 100644
+--- a/hub/route/cloudflare.go
++++ b/hub/route/cloudflare.go
+@@ -31,6 +31,7 @@ func cloudflareRouter(secret string) http.Handler {
+ 			"supported": true, "preferredDomains": cloudflaretest.PreferredDomains(), "budgetBytes": cloudflaretest.BudgetBytes,
+ 			"dnsAliases": true, "fixedAddressFamily": true, "engineVersion": cloudflaretest.EngineVersion,
+ 			"method": cloudflaretest.Method, "domainOnly": true, "upstreamCommit": cloudflaretest.UpstreamCommit,
++			"latencyMethod": cloudflaretest.LatencyMethod,
+ 		})
+ 	})
+ 	r.Post("/jobs", func(w http.ResponseWriter, req *http.Request) {
+diff --git a/hub/route/cloudflare_test.go b/hub/route/cloudflare_test.go
+index 4de9eb3..2808f52 100644
+--- a/hub/route/cloudflare_test.go
++++ b/hub/route/cloudflare_test.go
+@@ -32,7 +32,7 @@ func TestCloudflareRequiresNonemptySecretAndAuthentication(t *testing.T) {
+ 			if err := json.Unmarshal(w.Body.Bytes(), &capability); err != nil {
+ 				t.Fatal(err)
+ 			}
+-			if capability["schemaVersion"] != float64(1) || capability["capability"] != "verge-cloudflare1" || capability["supported"] != true || capability["engineVersion"] != "cf-speedtest2" || capability["method"] != "verge-cfst-transfer-v2" || capability["domainOnly"] != true {
++			if capability["schemaVersion"] != float64(1) || capability["capability"] != "verge-cloudflare1" || capability["supported"] != true || capability["engineVersion"] != "cf-speedtest2" || capability["method"] != "verge-cfst-transfer-v2" || capability["domainOnly"] != true || capability["latencyMethod"] != "tcp-connect" {
+ 				t.Fatal(capability)
+ 			}
+ 		}
