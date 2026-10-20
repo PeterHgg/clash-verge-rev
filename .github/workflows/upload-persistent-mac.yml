@@ -1,0 +1,129 @@
+name: Upload Persistent Bindings Mac packages
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [adaptive/upload-persistent]
+    paths: [.github/workflows/upload-persistent-mac.yml]
+
+permissions:
+  actions: read
+  contents: write
+
+concurrency:
+  group: upload-persistent-mac-release
+  cancel-in-progress: false
+
+jobs:
+  upload:
+    if: github.repository == 'PeterHgg/clash-verge-rev'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: PeterHgg/clash-verge-rev
+      SOURCE_RUN: '39439007423'
+      SOURCE_SHA: 1b7b28ba922f6ba5e87f92243f34b47451d6e317
+      RELEASE_TAG: persistent-bindings-2.5.9-test.1
+    steps:
+      - name: Wait for existing Mac build without recompiling
+        run: gh run watch "$SOURCE_RUN" --interval 60 --exit-status
+      - name: Verify source build and destination
+        run: |
+          set -euo pipefail
+          gh run view "$SOURCE_RUN" --json conclusion,headSha > "$RUNNER_TEMP/source-run.json"
+          jq -e --arg sha "$SOURCE_SHA" '.conclusion == "success" and .headSha == $sha' "$RUNNER_TEMP/source-run.json"
+          gh api "repos/$GH_REPO/releases/tags/$RELEASE_TAG" > "$RUNNER_TEMP/release.json"
+          jq -e --arg sha "$SOURCE_SHA" '.target_commitish == $sha and .prerelease == true' "$RUNNER_TEMP/release.json"
+      - name: Download existing Actions artifacts on runner
+        run: |
+          set -euo pipefail
+          mkdir "$RUNNER_TEMP/mac-artifacts"
+          gh run download "$SOURCE_RUN" --dir "$RUNNER_TEMP/mac-artifacts" \
+            --name PersistentBindings-2.5.9-arm64-app \
+            --name PersistentBindings-2.5.9-arm64-dmg
+      - name: Verify checksums and core provenance
+        env:
+          ARTIFACT_ROOT: ${{ runner.temp }}/mac-artifacts
+        run: |
+          python3 -I - <<'PY'
+          import hashlib, json, os, pathlib, shutil
+          root = pathlib.Path(os.environ['ARTIFACT_ROOT'])
+          ledgers = list(root.glob('*/SHA256SUMS'))
+          assert len(ledgers) == 2, 'Expected app and DMG artifacts'
+          packages = []
+          core_hashes = []
+          for ledger in ledgers:
+              for line in ledger.read_text().splitlines():
+                  expected, name = line.split('  ', 1)
+                  assert pathlib.PurePosixPath(name).name == name, 'Unsafe artifact filename'
+                  path = ledger.parent / name
+                  assert path.is_file()
+                  assert hashlib.sha256(path.read_bytes()).hexdigest() == expected, name
+              metadata = json.loads((ledger.parent / 'package.json').read_text())
+              assert metadata['target'] == 'aarch64-apple-darwin'
+              assert metadata['source'] == f"https://github.com/{os.environ['GH_REPO']}/tree/{os.environ['SOURCE_SHA']}"
+              assert metadata['identicalCoreEntries'] is True
+              assert metadata['appleNotarized'] is False
+              assert 'v1.19.32-verge-adaptive1-cf5' in metadata['version'].split()
+              core_hashes.append(metadata['packagedCoreSha256'])
+              for name, digest in metadata['installers'].items():
+                  path = ledger.parent / name
+                  assert path.suffix in ('.dmg', '.zip')
+                  assert hashlib.sha256(path.read_bytes()).hexdigest() == digest
+                  packages.append(path)
+          assert len(set(core_hashes)) == 1, 'App and DMG core hashes differ'
+          expected_names = {'Clash.Verge_2.5.9_arm64_CloudflarePersistentBindings.dmg', 'Clash.Verge_2.5.9_arm64_CloudflarePersistentBindings.app.zip'}
+          assert len(packages) == 2 and {p.name for p in packages} == expected_names
+          output = root / 'upload'
+          output.mkdir()
+          checksums = []
+          for path in packages:
+              shutil.copyfile(path, output / path.name)
+              checksums.append(f'{hashlib.sha256(path.read_bytes()).hexdigest()}  {path.name}')
+          (output / 'Mac-arm64-SHA256SUMS.txt').write_text('\n'.join(checksums) + '\n')
+          dmg = root / 'PersistentBindings-2.5.9-arm64-dmg'
+          shutil.copyfile(dmg / 'core-build.json', output / 'Mac-arm64-core-build.json')
+          shutil.copyfile(dmg / 'package.json', output / 'Mac-arm64-package.json')
+          print('Verified existing Mac packages; no compilation performed')
+          PY
+      - name: Upload missing assets without replacing existing files
+        run: |
+          set -euo pipefail
+          for file in "$RUNNER_TEMP/mac-artifacts/upload/"*; do
+            name="$(basename "$file")"
+            expected="sha256:$(sha256sum "$file" | cut -d ' ' -f 1)"
+            existing="$(gh api "repos/$GH_REPO/releases/tags/$RELEASE_TAG" --jq ".assets[] | select(.name == \"$name\") | .digest")"
+            if [ -n "$existing" ]; then
+              test "$existing" = "$expected"
+              printf 'Preserved already verified asset: %s\n' "$name"
+            else
+              gh release upload "$RELEASE_TAG" "$file"
+            fi
+          done
+      - name: Verify uploaded assets and update release status
+        run: |
+          set -euo pipefail
+          gh api "repos/$GH_REPO/releases/tags/$RELEASE_TAG" > "$RUNNER_TEMP/published-release.json"
+          python3 -I - <<'PY'
+          import hashlib, json, os, pathlib
+          temp = pathlib.Path(os.environ['RUNNER_TEMP'])
+          release = json.loads((temp / 'published-release.json').read_text())
+          assets = {asset['name']: asset for asset in release['assets']}
+          for path in (temp / 'mac-artifacts' / 'upload').iterdir():
+              asset = assets[path.name]
+              assert asset['state'] == 'uploaded' and asset['size'] == path.stat().st_size
+              assert asset['digest'] == 'sha256:' + hashlib.sha256(path.read_bytes()).hexdigest()
+          notes = release['body']
+          notes = notes.replace(
+              'the arm64 DMG and `.app.zip` are built with GitHub Actions and added after final artifact verification. **No Intel Mac build is planned.** Until the Mac attachments appear, the Mac package is not yet delivered.',
+              'the arm64 DMG and `.app.zip` were built with GitHub Actions and verified before upload. **No Intel Mac build is included.**')
+          notes = notes.replace('Mac package status: pending build and upload verification.', 'Mac package status: built, checksummed and uploaded successfully.')
+          build_link = f"Mac arm64 build: https://github.com/{os.environ['GH_REPO']}/actions/runs/{os.environ['SOURCE_RUN']}"
+          if build_link not in notes:
+              notes += '\n\n' + build_link + '\n'
+          (temp / 'release-notes.md').write_text(notes)
+          print(release['html_url'])
+          PY
+          gh release edit "$RELEASE_TAG" --notes-file "$RUNNER_TEMP/release-notes.md"
+          printf 'Mac packages uploaded and verified: https://github.com/%s/releases/tag/%s\n' "$GH_REPO" "$RELEASE_TAG" >> "$GITHUB_STEP_SUMMARY"
