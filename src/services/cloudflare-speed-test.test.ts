@@ -16,7 +16,9 @@ import {
   CLOUDFLARE_PREFERRED_DOMAINS,
   CLOUDFLARE_TEST_URL,
   applyCloudflareDnsBindings,
+  cloudflareBindingRows,
   eligibleCloudflareDomains,
+  formatCloudflareBindingStatus,
   formatCloudflareBytes,
   formatCloudflareDiagnostic,
   formatCloudflareMbps,
@@ -339,6 +341,109 @@ const binding = (domain = 'node.example'): CloudflareDnsBinding => ({
   domain,
   target: { kind: 'preferred_domain', domain: CLOUDFLARE_PREFERRED_DOMAINS[0] },
 })
+const inventory = (
+  restoreStatus: CloudflareDnsInventory_Serialize['restoreStatus'],
+  fields: Partial<CloudflareDnsInventory_Serialize> = {},
+): CloudflareDnsInventory_Serialize => ({
+  profileUid: 'profile',
+  fingerprint: 'fingerprint',
+  bindings: [binding()],
+  domains: [],
+  enabled: true,
+  effectiveEnabled: false,
+  appliedDomains: [],
+  dormantDomains: [],
+  restoreStatus,
+  useHosts: true,
+  unknownSources: [],
+  warnings: [],
+  ...fields,
+})
+
+it('shows startup and restoration as waiting, and only confirmed failures as errors', () => {
+  expect(formatCloudflareBindingStatus(translate, undefined, null)).toBeNull()
+  for (const state of ['pending', 'restoring'] as const) {
+    expect(
+      formatCloudflareBindingStatus(
+        translate,
+        inventory(state, { restoreReason: 'Previous core error' }),
+        null,
+      ),
+    ).toEqual({
+      severity: 'waiting',
+      message:
+        state === 'pending'
+          ? zhSettings.modals.cloudflare.bindingWaiting
+          : zhSettings.modals.cloudflare.bindingRestoring,
+    })
+  }
+  const failed = inventory('error', {
+    restoreReason: 'Core authentication failed',
+  })
+  expect(formatCloudflareBindingStatus(translate, failed, null)).toEqual({
+    severity: 'error',
+    message: `${zhSettings.modals.cloudflare.notApplied} Core authentication failed`,
+  })
+  for (const state of ['active', 'dormant'] as const) {
+    expect(
+      formatCloudflareBindingStatus(translate, inventory(state), null),
+    ).toBeNull()
+  }
+  expect(
+    formatCloudflareBindingStatus(
+      translate,
+      { ...failed, enabled: false },
+      null,
+    ),
+  ).toBeNull()
+  expect(
+    formatCloudflareBindingStatus(translate, { ...failed, bindings: [] }, null),
+  ).toBeNull()
+  const unsaved = {
+    status: 'applied' as const,
+    saved: false,
+    error: 'Disk full',
+  }
+  expect(
+    formatCloudflareBindingStatus(translate, inventory('restoring'), unsaved),
+  ).toEqual({
+    severity: 'error',
+    message: `${zhSettings.modals.cloudflare.notSaved} Disk full`,
+  })
+  const rejected = {
+    status: 'applied' as const,
+    saved: true,
+    error: 'Reload rejected',
+  }
+  expect(formatCloudflareBindingStatus(translate, failed, rejected)).toEqual({
+    severity: 'error',
+    message: `${zhSettings.modals.cloudflare.notApplied} Reload rejected`,
+  })
+})
+
+it('retains saved rows through pending, dormant, partial application, and restore failures', () => {
+  const saved = [binding(), binding('missing.example')]
+  for (const state of [
+    'pending',
+    'restoring',
+    'active',
+    'dormant',
+    'error',
+  ] as const) {
+    const current = inventory(state, {
+      bindings: saved,
+      appliedDomains: state === 'active' ? ['node.example'] : [],
+      dormantDomains: ['missing.example'],
+    })
+    expect(cloudflareBindingRows(current)).toEqual([
+      { binding: saved[0], dormant: false },
+      { binding: saved[1], dormant: true },
+    ])
+    expect(current.bindings).toBe(saved)
+    expect(saved).toEqual([binding(), binding('missing.example')])
+  }
+})
+
 const confirmation = {
   status: 'confirmation_required' as const,
   confirmation: 'captured-token',

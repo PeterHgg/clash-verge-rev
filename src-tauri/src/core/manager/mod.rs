@@ -1,3 +1,4 @@
+mod binding_restore;
 mod config;
 pub(crate) use config::ConfigUpdateGuard;
 mod lifecycle;
@@ -97,6 +98,7 @@ pub struct CoreManager {
     core_readiness_state: AtomicU64,
     startup_error: parking_lot::Mutex<Option<CoreFailure>>,
     sidecar_exit: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    binding_restore: parking_lot::Mutex<binding_restore::BindingRestore>,
     // 串行化 start/stop/restart 和 sidecar→service 交接。
     // 锁序固定为 config_update_in_progress → lifecycle_lock。
     pub(crate) lifecycle_lock: tokio::sync::Mutex<()>,
@@ -126,6 +128,7 @@ impl Default for CoreManager {
             core_readiness_state: AtomicU64::new(0),
             startup_error: parking_lot::Mutex::new(None),
             sidecar_exit: tokio::sync::Mutex::new(None),
+            binding_restore: parking_lot::Mutex::new(binding_restore::BindingRestore::default()),
             lifecycle_lock: tokio::sync::Mutex::new(()),
             #[cfg(target_os = "windows")]
             handoff_watcher_running: AtomicBool::new(false),

@@ -764,7 +764,10 @@
       },
       "apply": "Terapkan",
       "confirmationFailed": "The core requested confirmation again. The change was not completed; refresh and retry.",
-      "notApplied": "The binding change did not finish applying."
+      "notApplied": "The binding change did not finish applying.",
+      "bindingWaiting": "Waiting for core readiness",
+      "bindingRestoring": "Restoring bindings",
+      "bindingDormant": "Dormant"
     }
   },
   "feedback": {

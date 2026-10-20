@@ -764,7 +764,10 @@
       },
       "apply": "套用",
       "confirmationFailed": "核心再次要求確認，變更未完成。請重新整理後重試。",
-      "notApplied": "綁定變更未完成套用。"
+      "notApplied": "綁定變更未完成套用。",
+      "bindingWaiting": "等待核心就緒",
+      "bindingRestoring": "正在恢復綁定",
+      "bindingDormant": "休眠"
     }
   },
   "feedback": {

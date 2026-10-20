@@ -22,6 +22,10 @@ pub struct CloudflareDnsRuntime {
     pub unknown_sources: Vec<String>,
     pub warnings: Vec<String>,
     pub active: bool,
+    pub applied_domains: Vec<String>,
+    pub dormant_domains: Vec<String>,
+    pub restore_status: CloudflareDnsRestoreStatus,
+    pub restore_reason: Option<String>,
 }
 
 pub fn digest(bytes: &[u8]) -> String {
@@ -223,22 +227,49 @@ pub async fn collect(mut base: Mapping, profiles: &IProfiles) -> Result<Cloudfla
         domains: groups.into_values().collect(),
         unknown_sources: Vec::new(),
         active: false,
+        applied_domains: Vec::new(),
+        dormant_domains: Vec::new(),
+        restore_status: CloudflareDnsRestoreStatus::Dormant,
+        restore_reason: None,
         warnings: Vec::new(),
     })
 }
 
+fn eligible(metadata: &CloudflareDnsRuntime, binding: &CloudflareDnsBinding) -> bool {
+    metadata.domains.iter().any(|domain| {
+        domain.domain == binding.domain
+            && domain.bindable
+            && domain.occurrences.iter().any(|occurrence| {
+                occurrence.bindable && matches!(occurrence.role, CloudflareOccurrenceRole::ProxyServer)
+            })
+    })
+}
+
 pub fn validate_eligibility(metadata: &CloudflareDnsRuntime, bindings: &[CloudflareDnsBinding]) -> Result<()> {
+    ensure!(
+        bindings.iter().all(|binding| eligible(metadata, binding)),
+        "The hostname is not a locally resolved proxy server in this committed profile"
+    );
+    Ok(())
+}
+
+pub fn validate_targets(bindings: &[CloudflareDnsBinding]) -> Result<()> {
+    ensure!(bindings.len() <= 128, "At most 128 hostname bindings are supported");
+    let mut domains = BTreeSet::new();
     for binding in bindings {
+        ensure!(domains.insert(&binding.domain), "Duplicate binding hostname");
         ensure!(
-            metadata.domains.iter().any(|domain| {
-                domain.domain == binding.domain
-                    && domain.bindable
-                    && domain.occurrences.iter().any(|occurrence| {
-                        occurrence.bindable && matches!(occurrence.role, CloudflareOccurrenceRole::ProxyServer)
-                    })
-            }),
-            "The hostname is not a locally resolved proxy server in this committed profile"
+            hostname(&binding.domain).as_deref() == Some(binding.domain.as_str()),
+            "Invalid binding hostname"
         );
+        match &binding.target {
+            CloudflareBindingTarget::PreferredDomain { domain } => {
+                ensure!(PREFERRED_DOMAINS.contains(&domain.as_str()), "Invalid preferred domain");
+            }
+            CloudflareBindingTarget::FixedIp { ip, .. } => {
+                crate::core::cloudflare_speed_test::public_address(ip)?;
+            }
+        }
     }
     Ok(())
 }
@@ -357,24 +388,13 @@ pub fn overlay(mut config: Mapping, bindings: &[CloudflareDnsBinding]) -> Result
     if bindings.is_empty() {
         return Ok(config);
     }
+    validate_targets(bindings)?;
     let mut hosts = config
         .get("hosts")
         .and_then(Value::as_mapping)
         .cloned()
         .unwrap_or_default();
     for binding in bindings {
-        ensure!(
-            hostname(&binding.domain).as_deref() == Some(binding.domain.as_str()),
-            "Invalid binding hostname"
-        );
-        match &binding.target {
-            CloudflareBindingTarget::PreferredDomain { domain } => {
-                ensure!(PREFERRED_DOMAINS.contains(&domain.as_str()), "Invalid preferred domain")
-            }
-            CloudflareBindingTarget::FixedIp { ip, .. } => {
-                ip.parse::<IpAddr>()?;
-            }
-        }
         hosts.retain(|key, _| {
             !key.as_str()
                 .is_some_and(|key| key.eq_ignore_ascii_case(&binding.domain))
@@ -443,21 +463,41 @@ async fn binary_supported() -> bool {
     supported
 }
 
-pub async fn apply(metadata: &mut CloudflareDnsRuntime, settings: &ProfileCloudflareDnsSettings) -> Result<Mapping> {
+fn persisted_overlay(metadata: &mut CloudflareDnsRuntime, settings: &ProfileCloudflareDnsSettings) -> Result<Mapping> {
+    metadata.active = false;
+    metadata.applied_domains.clear();
+    metadata.dormant_domains.clear();
+    metadata.restore_status = CloudflareDnsRestoreStatus::Dormant;
+    metadata.restore_reason = None;
     if !settings.enabled || settings.bindings.is_empty() {
         return Ok(metadata.base.clone());
     }
-    if validate_eligibility(metadata, &settings.bindings).is_err() {
-        metadata.warnings.push(
-            "Saved bindings are inactive because a hostname is no longer a locally resolved proxy server; remove invalid bindings before applying again".into(),
-        );
-        return Ok(metadata.base.clone());
+    validate_targets(&settings.bindings)?;
+    let (bindings, dormant): (Vec<_>, Vec<_>) = settings
+        .bindings
+        .iter()
+        .cloned()
+        .partition(|binding| eligible(metadata, binding));
+    metadata.dormant_domains = dormant.into_iter().map(|binding| binding.domain).collect();
+    let config = overlay(metadata.base.clone(), &bindings)?;
+    metadata.applied_domains = bindings.into_iter().map(|binding| binding.domain).collect();
+    metadata.active = !metadata.applied_domains.is_empty();
+    if metadata.active {
+        metadata.restore_status = CloudflareDnsRestoreStatus::Active;
     }
-    let confirmed = settings.confirmation.as_deref() == Some(confirmation(metadata, settings)?.as_str());
-    let supported = if matches!(
+    Ok(config)
+}
+
+pub async fn apply(metadata: &mut CloudflareDnsRuntime, settings: &ProfileCloudflareDnsSettings) -> Result<Mapping> {
+    let config = persisted_overlay(metadata, settings)?;
+    if !metadata.active {
+        return Ok(config);
+    }
+    let not_running = matches!(
         *crate::core::CoreManager::global().get_running_mode(),
         crate::core::manager::RunningMode::NotRunning
-    ) {
+    );
+    let supported = if not_running {
         let state = crate::core::runstate::RUN_STATE.state();
         let known_sidecar = !state.op_in_flight
             && (state.sidecar_allowed || matches!(state.health, crate::core::runstate::ServiceHealth::NotInstalled));
@@ -466,19 +506,19 @@ pub async fn apply(metadata: &mut CloudflareDnsRuntime, settings: &ProfileCloudf
         let capability = crate::core::cloudflare_speed_test::capability().await;
         capability.compatible() && capability.dns_aliases && capability.fixed_address_family
     };
-    if !confirmed || !supported {
-        metadata.warnings.push(
-            if !confirmed {
-                "Saved bindings are inactive because the profile sources changed; review and apply them again"
-            } else {
-                "Saved bindings are inactive because DNS binding support could not be confirmed for this core"
-            }
-            .into(),
-        );
+    if !supported {
+        metadata.active = false;
+        metadata.applied_domains.clear();
+        metadata.restore_status = if not_running {
+            CloudflareDnsRestoreStatus::Pending
+        } else {
+            CloudflareDnsRestoreStatus::Error
+        };
+        if !not_running {
+            metadata.restore_reason = Some("DNS binding support could not be confirmed for the running core".into());
+        }
         return Ok(metadata.base.clone());
     }
-    let config = overlay(metadata.base.clone(), &settings.bindings)?;
-    metadata.active = true;
     Ok(config)
 }
 
@@ -599,6 +639,10 @@ server: arbitrary.example
             unknown_sources: Vec::new(),
             warnings: Vec::new(),
             active: false,
+            applied_domains: Vec::new(),
+            dormant_domains: Vec::new(),
+            restore_status: CloudflareDnsRestoreStatus::Dormant,
+            restore_reason: None,
         };
         let mut settings = ProfileCloudflareDnsSettings {
             enabled: true,
@@ -622,6 +666,182 @@ server: arbitrary.example
         assert_eq!(apply(&mut metadata, &settings).await?, base);
         Ok(())
     }
+    fn restored_metadata(base: Mapping, updated: u64) -> Result<CloudflareDnsRuntime> {
+        let mut groups = BTreeMap::new();
+        scan_inline_nodes(&base, &mut groups);
+        exclude_controllers(&base, &mut groups);
+        Ok(CloudflareDnsRuntime {
+            profile_uid: "profile".into(),
+            fingerprint: digest(format!("{}\0{updated}", serde_yaml_ng::to_string(&base)?).as_bytes()),
+            base,
+            domains: groups.into_values().collect(),
+            unknown_sources: Vec::new(),
+            warnings: Vec::new(),
+            active: false,
+            applied_domains: Vec::new(),
+            dormant_domains: Vec::new(),
+            restore_status: CloudflareDnsRestoreStatus::Dormant,
+            restore_reason: None,
+        })
+    }
+
+    #[test]
+    fn persisted_fixed_target_survives_reload_old_run_and_changed_sources() -> Result<()> {
+        let base: Mapping = serde_yaml_ng::from_str(
+            "proxies: [{server: node.example, sni: identity.example}]\nproxy-providers: {inline: {payload: [{server: provider.example}]}}",
+        )?;
+        let original = restored_metadata(base.clone(), 1)?;
+        let mut settings = ProfileCloudflareDnsSettings {
+            enabled: true,
+            bindings: vec![CloudflareDnsBinding {
+                domain: "node.example".into(),
+                target: CloudflareBindingTarget::FixedIp {
+                    ip: "104.16.0.1".into(),
+                    run_id: "previous-app-run".into(),
+                },
+            }],
+            confirmation: None,
+        };
+        settings.confirmation = Some(confirmation(&original, &settings)?);
+        let profiles = BTreeMap::from([("profile".to_owned(), settings)]);
+        let path = std::env::temp_dir().join(format!("verge-binding-{}.yaml", nanoid::nanoid!()));
+        let _cleanup = scopeguard::guard(path.clone(), |path| {
+            let _ = std::fs::remove_file(path);
+        });
+        std::fs::write(&path, serde_yaml_ng::to_string(&profiles)?)?;
+        let saved: BTreeMap<String, ProfileCloudflareDnsSettings> = serde_yaml_ng::from_slice(&std::fs::read(&path)?)?;
+        let settings = &saved["profile"];
+        let mut changed = base;
+        changed.insert("mixed-port".into(), 7899.into());
+        changed.insert("external-controller".into(), "127.0.0.1:9999".into());
+        changed.insert("dns".into(), serde_yaml_ng::from_str::<Value>("{use-hosts: false}")?);
+        changed.insert(
+            "proxy-providers".into(),
+            serde_yaml_ng::from_str::<Value>("{inline: {payload: [{server: updated-provider.example}]}}")?,
+        );
+        let mut restarted = restored_metadata(changed, 2)?;
+        assert_ne!(restarted.fingerprint, original.fingerprint);
+        assert_ne!(
+            settings.confirmation.as_deref(),
+            Some(confirmation(&restarted, settings)?.as_str())
+        );
+        let applied = persisted_overlay(&mut restarted, settings)?;
+        assert_eq!(
+            applied["hosts"]["node.example"],
+            serde_yaml_ng::to_value(["104.16.0.1"])?
+        );
+        assert_eq!(applied["proxies"][0]["sni"], Value::String("identity.example".into()));
+        assert_eq!(restarted.applied_domains, ["node.example"]);
+        assert_eq!(restarted.restore_status, CloudflareDnsRestoreStatus::Active);
+        assert_eq!(serde_yaml_ng::to_string(&saved)?, serde_yaml_ng::to_string(&profiles)?);
+        assert!(!saved.contains_key("different-profile"));
+        let mut disabled = settings.clone();
+        disabled.enabled = false;
+        std::fs::write(&path, serde_yaml_ng::to_string(&disabled)?)?;
+        let mut disabled: ProfileCloudflareDnsSettings = serde_yaml_ng::from_slice(&std::fs::read(&path)?)?;
+        assert_eq!(persisted_overlay(&mut restarted, &disabled)?, restarted.base);
+        assert_eq!(disabled.bindings, settings.bindings);
+        disabled.enabled = true;
+        disabled.bindings.clear();
+        std::fs::write(&path, serde_yaml_ng::to_string(&disabled)?)?;
+        let removed: ProfileCloudflareDnsSettings = serde_yaml_ng::from_slice(&std::fs::read(&path)?)?;
+        assert_eq!(persisted_overlay(&mut restarted, &removed)?, restarted.base);
+        assert!(!restarted.active && restarted.applied_domains.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn absent_and_remote_nodes_stay_saved_without_blocking_eligible_bindings() -> Result<()> {
+        let bindings = ["good.example", "provider.example", "remote.example"]
+            .map(|domain| CloudflareDnsBinding {
+                domain: domain.into(),
+                target: CloudflareBindingTarget::PreferredDomain {
+                    domain: PREFERRED_DOMAINS[0].into(),
+                },
+            })
+            .to_vec();
+        let mut settings = ProfileCloudflareDnsSettings {
+            enabled: true,
+            bindings,
+            confirmation: Some("old-confirmation".into()),
+        };
+        let saved = serde_json::to_value(&settings)?;
+        let mut metadata = restored_metadata(
+            serde_yaml_ng::from_str(
+                "proxies: [{server: good.example}, {server: remote.example, remote-dns-resolve: true}]\nproxy-providers: {unloaded: {path: missing.yaml}}",
+            )?,
+            1,
+        )?;
+        let applied = persisted_overlay(&mut metadata, &settings)?;
+        assert_eq!(applied["hosts"].as_mapping().map(Mapping::len), Some(1));
+        assert_eq!(metadata.applied_domains, ["good.example"]);
+        assert_eq!(metadata.dormant_domains, ["provider.example", "remote.example"]);
+        assert_eq!(serde_json::to_value(&settings)?, saved);
+        let returned = serde_yaml_ng::from_str(
+            "proxies: [{server: good.example}, {server: remote.example}]\nproxy-providers: {loaded: {payload: [{server: provider.example}]}}",
+        )?;
+        metadata = restored_metadata(returned, 2)?;
+        assert_eq!(
+            persisted_overlay(&mut metadata, &settings)?["hosts"]
+                .as_mapping()
+                .map(Mapping::len),
+            Some(3)
+        );
+        assert!(metadata.dormant_domains.is_empty());
+        settings.enabled = false;
+        assert_eq!(persisted_overlay(&mut metadata, &settings)?, metadata.base);
+        assert!(!metadata.active && metadata.applied_domains.is_empty());
+        settings.enabled = true;
+        settings.bindings.clear();
+        for _ in 0..2 {
+            assert_eq!(persisted_overlay(&mut metadata, &settings)?, metadata.base);
+            assert!(!metadata.active && metadata.applied_domains.is_empty());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn saved_targets_still_require_public_canonical_addresses_and_acyclic_aliases() -> Result<()> {
+        for ip in [
+            "127.0.0.1",
+            "192.0.2.1",
+            "::1",
+            "2001:db8::1",
+            "2606:4700:4700:0:0:0:0:1111",
+        ] {
+            assert!(
+                validate_targets(&[CloudflareDnsBinding {
+                    domain: "node.example".into(),
+                    target: CloudflareBindingTarget::FixedIp {
+                        ip: ip.into(),
+                        run_id: "old".into()
+                    },
+                }])
+                .is_err()
+            );
+        }
+        let mut binding = CloudflareDnsBinding {
+            domain: "node.example".into(),
+            target: CloudflareBindingTarget::PreferredDomain {
+                domain: PREFERRED_DOMAINS[0].into(),
+            },
+        };
+        assert!(validate_targets(&[binding.clone(), binding.clone()]).is_err());
+        binding.domain = "NODE.EXAMPLE".into();
+        assert!(validate_targets(&[binding.clone()]).is_err());
+        binding.domain = "node.example".into();
+        binding.target = CloudflareBindingTarget::PreferredDomain {
+            domain: "untrusted.example".into(),
+        };
+        assert!(validate_targets(&[binding.clone()]).is_err());
+        binding.target = CloudflareBindingTarget::PreferredDomain {
+            domain: PREFERRED_DOMAINS[0].into(),
+        };
+        let base = serde_yaml_ng::from_str(&format!("hosts: {{{}: node.example}}", PREFERRED_DOMAINS[0]))?;
+        assert!(overlay(base, &[binding]).is_err());
+        Ok(())
+    }
+
     #[test]
     fn overlay_is_final_and_disabling_regenerates_exact_base() -> Result<()> {
         for dns in ["", "dns: {use-hosts: false}", "dns: {use-hosts: true}"] {

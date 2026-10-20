@@ -1,4 +1,4 @@
-use super::{CoreManager, PROFILE_SELECTIONS_PENDING_COMMIT, RunningMode};
+use super::{CoreManager, PROFILE_SELECTIONS_PENDING_COMMIT, RunningMode, binding_restore::RestoreCapture};
 use crate::core::notify::NoticeStatus;
 use crate::core::service::StageRequest;
 use crate::{
@@ -128,6 +128,36 @@ where
         Ok(answered) => answered,
         Err(_) => StageAttempt::Unanswered(format!("{first}; the second ask did not answer either").into()),
     }
+}
+
+async fn apply_guarded_runtime<T, ApplyFuture>(
+    runtime: &IRuntime,
+    check: impl FnOnce(&IRuntime) -> Result<()>,
+    apply: impl FnOnce() -> ApplyFuture,
+) -> Result<T>
+where
+    ApplyFuture: std::future::Future<Output = Result<T>>,
+{
+    check(runtime)?;
+    apply().await
+}
+
+async fn validate_and_reload_restored_runtime<Validate, Reload, ReloadFuture>(
+    transaction: DraftTransaction<'_>,
+    validate: Validate,
+    reload: Reload,
+) -> Result<()>
+where
+    Validate: std::future::Future<Output = Result<ValidationOutcome>>,
+    Reload: FnOnce() -> ReloadFuture,
+    ReloadFuture: std::future::Future<Output = Result<bool>>,
+{
+    let outcome = validate.await?;
+    anyhow::ensure!(outcome.is_valid(), "{outcome}");
+    if reload().await? {
+        transaction.commit();
+    }
+    Ok(())
 }
 
 impl CoreManager {
@@ -276,6 +306,26 @@ impl CoreManager {
         } else {
             Err(anyhow!("{outcome}"))
         }
+    }
+
+    pub(crate) async fn update_config_checked_with_runtime_guard<F>(&self, check: F) -> Result<()>
+    where
+        F: FnOnce(&IRuntime) -> Result<()> + Send,
+    {
+        anyhow::ensure!(!handle::Handle::global().is_exiting(), "application is exiting");
+        anyhow::ensure!(
+            self.try_start_config_update(),
+            "configuration update is already running"
+        );
+        let _update = ConfigUpdateGuard(self);
+        self.set_last_update(Instant::now());
+        let runtime = Config::runtime().await;
+        let transaction = DraftTransaction::begin(vec![&runtime])?;
+        Config::generate().await?;
+        let generated = runtime.latest_arc();
+        let outcome = apply_guarded_runtime(&generated, check, || self.validate_and_apply(transaction)).await?;
+        anyhow::ensure!(outcome.is_valid(), "{outcome}");
+        Ok(())
     }
 
     fn should_update_config(&self) -> bool {
@@ -434,6 +484,81 @@ impl CoreManager {
         Ok(())
     }
 
+    pub(super) async fn restore_bindings_in_update(
+        &self,
+        capture: &RestoreCapture,
+        _update: &ConfigUpdateGuard<'_>,
+    ) -> Result<()> {
+        let _lifecycle = self.lifecycle_lock.lock().await;
+        let Some(needs_restore) = self.saved_bindings_need_restore(capture).await else {
+            return Ok(());
+        };
+        let capability = crate::core::cloudflare_speed_test::capability().await;
+        anyhow::ensure!(
+            capability.compatible() && capability.dns_aliases && capability.fixed_address_family,
+            "{}",
+            capability
+                .reason
+                .as_deref()
+                .unwrap_or("The running core does not support DNS bindings")
+        );
+        if !needs_restore || !self.binding_restore_is_current(capture).await {
+            return Ok(());
+        }
+        let runtime = Config::runtime().await;
+        let transaction = DraftTransaction::begin(vec![&runtime])?;
+        Config::generate().await?;
+        let metadata = runtime.latest_arc();
+        if let Some(metadata) = &metadata.cloudflare_dns {
+            anyhow::ensure!(
+                !matches!(
+                    metadata.restore_status,
+                    crate::config::cloudflare_speed_test::CloudflareDnsRestoreStatus::Error
+                        | crate::config::cloudflare_speed_test::CloudflareDnsRestoreStatus::Pending
+                ),
+                "{}",
+                metadata
+                    .restore_reason
+                    .as_deref()
+                    .unwrap_or("DNS binding restoration was not accepted")
+            );
+        }
+        let yaml = Config::runtime_config_yaml().await?;
+        validate_and_reload_restored_runtime(
+            transaction,
+            CoreConfigValidator::global().validate_config_outcome_with(&yaml),
+            || async {
+                if !self.binding_restore_is_current(capture).await {
+                    return Ok(false);
+                }
+                let path = Config::write_runtime_file(&yaml).await?;
+                let reload_path = if matches!(*self.get_running_mode(), RunningMode::Service) {
+                    match self.attempt_staging(&path).await {
+                        StageAttempt::Answered(StageRuntimeOutcome::Staged { config_path }) => config_path,
+                        attempt => {
+                            anyhow::bail!("DNS binding restoration requires in-place service staging: {attempt:?}")
+                        }
+                    }
+                } else {
+                    dirs::path_to_str(&path)?.to_owned()
+                };
+                // Owner loss can invalidate readiness without acquiring lifecycle ownership.
+                if !self.binding_restore_is_current(capture).await {
+                    return Ok(false);
+                }
+                self.reload_config(&reload_path).await?;
+                Ok(true)
+            },
+        )
+        .await?;
+        if matches!(*self.get_running_mode(), RunningMode::Service) {
+            crate::core::service::request_runtime_provider_sync(timing::RUNTIME_PROVIDER_SYNC_DELAY);
+        }
+        #[cfg(target_os = "macos")]
+        crate::utils::resolve::dns::sync_public_dns().await;
+        Ok(())
+    }
+
     async fn attempt_staging(&self, path: &std::path::Path) -> StageAttempt {
         if !crate::core::service::active_service_supports_runtime_staging() {
             return StageAttempt::Unsupported;
@@ -498,6 +623,104 @@ mod tests {
             manager.retain_applied_runtime(&runtime, previous, &result);
             transaction.rollback();
             assert_eq!(runtime.data_arc().exists_keys.contains("replacement"), replaced);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_stale_generated_runtime_is_rejected_before_validation_or_reload() -> anyhow::Result<()> {
+        use crate::config::runtime::IRuntime;
+        use clash_verge_draft::{Draft, DraftTransaction};
+        use std::cell::Cell;
+
+        #[derive(Debug)]
+        struct Stale;
+        impl std::fmt::Display for Stale {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("stale")
+            }
+        }
+        impl std::error::Error for Stale {}
+
+        let runtime = Draft::new(IRuntime::default());
+        let transaction = DraftTransaction::begin(vec![&runtime])?;
+        runtime.edit_draft(|draft| {
+            draft.exists_keys.insert("stale-target".into());
+        });
+        let generated = runtime.latest_arc();
+        let applied = Cell::new(false);
+        let result = super::apply_guarded_runtime(
+            &generated,
+            |_| Err(Stale.into()),
+            || async {
+                applied.set(true);
+                transaction.commit();
+                Ok(())
+            },
+        )
+        .await;
+        assert!(result.unwrap_err().is::<Stale>());
+        assert!(!applied.get());
+        assert!(!runtime.data_arc().exists_keys.contains("stale-target"));
+        assert!(!runtime.latest_arc().exists_keys.contains("stale-target"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn validated_restore_only_publishes_bindings_after_reload_acceptance() -> anyhow::Result<()> {
+        use crate::{config::runtime::IRuntime, core::validate::ValidationOutcome};
+        use clash_verge_draft::{Draft, DraftTransaction};
+        use std::cell::RefCell;
+
+        for (valid, current, accepted) in [
+            (false, true, true),
+            (true, false, true),
+            (true, true, false),
+            (true, true, true),
+        ] {
+            let runtime = Draft::new(IRuntime::default());
+            let transaction = DraftTransaction::begin(vec![&runtime])?;
+            let events = RefCell::new(Vec::new());
+            runtime.edit_draft(|draft| {
+                draft.exists_keys.insert("bindings".into());
+            });
+            let result = super::validate_and_reload_restored_runtime(
+                transaction,
+                async {
+                    events.borrow_mut().push("validate");
+                    Ok(if valid {
+                        ValidationOutcome::Valid
+                    } else {
+                        ValidationOutcome::invalid_from_message("invalid binding")
+                    })
+                },
+                || async {
+                    if !current {
+                        return Ok(false);
+                    }
+                    events.borrow_mut().push("reload");
+                    anyhow::ensure!(accepted, "reload rejected");
+                    Ok(true)
+                },
+            )
+            .await;
+            assert_eq!(result.is_ok(), valid && (!current || accepted));
+            assert_eq!(
+                runtime.data_arc().exists_keys.contains("bindings"),
+                valid && current && accepted
+            );
+            assert_eq!(
+                events.into_inner(),
+                if valid && current {
+                    vec!["validate", "reload"]
+                } else {
+                    vec!["validate"]
+                }
+            );
+            if valid && current && accepted {
+                let _later_notification_error: anyhow::Result<()> = Err(anyhow::anyhow!("notification failed"));
+                assert!(runtime.data_arc().exists_keys.contains("bindings"));
+            }
         }
         Ok(())
     }

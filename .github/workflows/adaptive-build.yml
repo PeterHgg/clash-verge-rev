@@ -1,4 +1,4 @@
-name: Cloudflare Measured Apple Silicon test package
+name: Persistent DNS bindings Apple Silicon test package
 
 on:
   workflow_dispatch:
@@ -84,7 +84,7 @@ jobs:
       - name: Upload verified application archive
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: CloudflareMeasured-2.5.9-arm64-app
+          name: PersistentBindings-2.5.9-arm64-app
           path: ${{ runner.temp }}/adaptive-app-artifacts/*
           if-no-files-found: error
           retention-days: 30
@@ -95,7 +95,7 @@ jobs:
           ditto "target/${{ matrix.target }}/release/bundle/macos/Clash Verge.app" "$staging/Clash Verge.app"
           ln -s /Applications "$staging/Applications"
           mkdir -p "target/${{ matrix.target }}/release/bundle/dmg"
-          hdiutil create -volname "Clash Verge" -srcfolder "$staging" -format UDZO "target/${{ matrix.target }}/release/bundle/dmg/Clash.Verge_2.5.9_arm64_CloudflareMeasured.dmg"
+          hdiutil create -volname "Clash Verge" -srcfolder "$staging" -format UDZO "target/${{ matrix.target }}/release/bundle/dmg/Clash.Verge_2.5.9_arm64_CloudflarePersistentBindings.dmg"
       - name: Verify final DMG and collect artifacts
         env:
           ADAPTIVE_TARGET: ${{ matrix.target }}
@@ -103,7 +103,7 @@ jobs:
       - name: Upload verified DMG
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: CloudflareMeasured-2.5.9-arm64-dmg
+          name: PersistentBindings-2.5.9-arm64-dmg
           path: ${{ runner.temp }}/adaptive-dmg-artifacts/*
           if-no-files-found: error
           retention-days: 30

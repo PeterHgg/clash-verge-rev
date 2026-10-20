@@ -96,6 +96,58 @@ export const supportsCloudflareDomainTest = (
   capability.latencyMethod === 'tcp-connect'
 
 const key = 'settings.modals.cloudflare'
+
+export const cloudflareBindingRows = (
+  inventory: Pick<CloudflareDnsInventory, 'bindings' | 'dormantDomains'>,
+) =>
+  inventory.bindings.map((binding) => ({
+    binding,
+    dormant: inventory.dormantDomains.includes(binding.domain),
+  }))
+
+export const formatCloudflareBindingStatus = (
+  t: (key: TranslationKey) => string,
+  inventory: CloudflareDnsInventory | undefined,
+  outcome: CloudflareBindingOutcome | null,
+): { severity: 'error' | 'waiting'; message: string } | null => {
+  if (outcome?.status === 'stale') {
+    return {
+      severity: 'error',
+      message: `${t(`${key}.stale`)} ${outcome.reason}`,
+    }
+  }
+  if (outcome?.status === 'confirmation_failed') {
+    return { severity: 'error', message: t(`${key}.confirmationFailed`) }
+  }
+  if (outcome?.status === 'applied' && (!outcome.saved || outcome.error)) {
+    return {
+      severity: 'error',
+      message: [
+        t(outcome.saved ? `${key}.notApplied` : `${key}.notSaved`),
+        outcome.error,
+      ]
+        .filter(Boolean)
+        .join(' '),
+    }
+  }
+  if (!inventory?.enabled || !inventory.bindings.length) return null
+  if (inventory.restoreStatus === 'pending') {
+    return { severity: 'waiting', message: t(`${key}.bindingWaiting`) }
+  }
+  if (inventory.restoreStatus === 'restoring') {
+    return { severity: 'waiting', message: t(`${key}.bindingRestoring`) }
+  }
+  if (inventory.restoreStatus === 'error') {
+    return {
+      severity: 'error',
+      message: [t(`${key}.notApplied`), inventory.restoreReason]
+        .filter(Boolean)
+        .join(' '),
+    }
+  }
+  return null
+}
+
 const diagnosticReasons = {
   resolution_failed: `${key}.diagnostics.reasons.resolutionFailed`,
   no_eligible_addresses: `${key}.diagnostics.reasons.noEligibleAddresses`,

@@ -350,6 +350,16 @@ pub struct CloudflareDomain {
     pub reason: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, specta::Type)]
+#[serde(rename_all = "snake_case")]
+pub enum CloudflareDnsRestoreStatus {
+    Pending,
+    Restoring,
+    Active,
+    Dormant,
+    Error,
+}
+
 #[derive(Debug, Clone, Serialize, specta::Type)]
 #[serde(rename_all = "camelCase")]
 pub struct CloudflareDnsInventory {
@@ -359,6 +369,11 @@ pub struct CloudflareDnsInventory {
     pub bindings: Vec<CloudflareDnsBinding>,
     pub enabled: bool,
     pub effective_enabled: bool,
+    pub applied_domains: Vec<String>,
+    pub dormant_domains: Vec<String>,
+    pub restore_status: CloudflareDnsRestoreStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub restore_reason: Option<String>,
     pub use_hosts: Option<bool>,
     pub unknown_sources: Vec<String>,
     pub warnings: Vec<String>,

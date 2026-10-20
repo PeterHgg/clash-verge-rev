@@ -8,7 +8,6 @@ use crate::{
 };
 use anyhow::{Result, ensure};
 use clash_verge_draft::DraftTransaction;
-use std::collections::BTreeSet;
 
 fn stale(
     profile_uid: &str,
@@ -23,18 +22,52 @@ fn stale(
     })
 }
 
+#[derive(Debug)]
+struct ManualBindingStale;
+
+impl std::fmt::Display for ManualBindingStale {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("Profile sources changed while preparing the binding update; refresh the inventory")
+    }
+}
+
+impl std::error::Error for ManualBindingStale {}
+
+fn validate_manual_generation(
+    runtime: &crate::config::runtime::IRuntime,
+    profile_uid: &str,
+    fingerprint: &str,
+    settings: &ProfileCloudflareDnsSettings,
+    activate: bool,
+) -> Result<()> {
+    let Some(metadata) = runtime.cloudflare_dns.as_ref() else {
+        return Err(ManualBindingStale.into());
+    };
+    if metadata.profile_uid != profile_uid
+        || metadata.fingerprint != fingerprint
+        || (activate
+            && settings.confirmation.as_deref() != Some(cloudflare_dns::confirmation(metadata, settings)?.as_str()))
+    {
+        return Err(ManualBindingStale.into());
+    }
+    ensure!(
+        !activate || metadata.active,
+        "The generated runtime could not activate the requested DNS bindings"
+    );
+    Ok(())
+}
+
 fn bindings_ready_for_activation(
     metadata: &cloudflare_dns::CloudflareDnsRuntime,
     previous: &[CloudflareDnsBinding],
     bindings: &[CloudflareDnsBinding],
 ) -> Result<bool> {
-    let eligibility = cloudflare_dns::validate_eligibility(metadata, bindings);
-    let removal_only = bindings.len() < previous.len() && bindings.iter().all(|binding| previous.contains(binding));
-    if eligibility.is_err() && removal_only {
-        return Ok(false);
+    for binding in bindings.iter().filter(|binding| !previous.contains(binding)) {
+        cloudflare_dns::validate_eligibility(metadata, std::slice::from_ref(binding))?;
     }
-    eligibility?;
-    Ok(!bindings.is_empty())
+    Ok(bindings
+        .iter()
+        .any(|binding| cloudflare_dns::validate_eligibility(metadata, std::slice::from_ref(binding)).is_ok()))
 }
 
 pub async fn get_cloudflare_dns_inventory() -> Result<CloudflareDnsInventory> {
@@ -58,6 +91,12 @@ pub async fn get_cloudflare_dns_inventory() -> Result<CloudflareDnsInventory> {
             .collect::<Vec<_>>(),
     );
     let effective_enabled = metadata.active;
+    let applied_domains = metadata.applied_domains.clone();
+    let dormant_domains = metadata.dormant_domains.clone();
+    let (restore_status, restore_reason) = CoreManager::global()
+        .get_binding_restore_status(&metadata.profile_uid)
+        .await
+        .unwrap_or((metadata.restore_status, metadata.restore_reason.clone()));
     let metadata = &refreshed;
     let verge = Config::verge().await.data_arc();
     let settings = verge
@@ -73,6 +112,10 @@ pub async fn get_cloudflare_dns_inventory() -> Result<CloudflareDnsInventory> {
         bindings: settings.bindings,
         enabled: settings.enabled,
         effective_enabled,
+        applied_domains,
+        dormant_domains,
+        restore_status,
+        restore_reason,
         use_hosts: metadata
             .base
             .get("dns")
@@ -120,7 +163,7 @@ pub async fn set_cloudflare_dns_bindings(
         return Ok(outcome);
     }
     let metadata = &refreshed;
-    ensure!(bindings.len() <= 128, "At most 128 hostname bindings are supported");
+    cloudflare_dns::validate_targets(&bindings)?;
     let verge = Config::verge().await;
     let previous = verge
         .data_arc()
@@ -130,13 +173,7 @@ pub async fn set_cloudflare_dns_bindings(
         .cloned()
         .unwrap_or_default();
     let activate = bindings_ready_for_activation(metadata, &previous.bindings, &bindings)?;
-    let mut domains = BTreeSet::new();
     for binding in &bindings {
-        ensure!(domains.insert(&binding.domain), "Duplicate binding hostname");
-        ensure!(
-            cloudflare_dns::hostname(&binding.domain).as_deref() == Some(binding.domain.as_str()),
-            "Invalid binding hostname"
-        );
         let unchanged = previous.bindings.contains(binding);
         if unchanged {
             continue;
@@ -163,7 +200,13 @@ pub async fn set_cloudflare_dns_bindings(
             capability.compatible() && capability.dns_aliases && capability.fixed_address_family,
             "The running core does not support safe Cloudflare DNS bindings"
         );
-        cloudflare_dns::overlay(metadata.base.clone(), &settings.bindings)?;
+        let eligible_bindings: Vec<_> = settings
+            .bindings
+            .iter()
+            .filter(|binding| cloudflare_dns::validate_eligibility(metadata, std::slice::from_ref(*binding)).is_ok())
+            .cloned()
+            .collect();
+        cloudflare_dns::overlay(metadata.base.clone(), &eligible_bindings)?;
         let token = cloudflare_dns::confirmation(metadata, &settings)?;
         if confirmation.as_ref() != Some(&token) {
             return Ok(CloudflareDnsOutcome::ConfirmationRequired {
@@ -189,7 +232,11 @@ pub async fn set_cloudflare_dns_bindings(
             .insert(profile_uid.clone(), settings.clone());
     });
     let manager = CoreManager::global();
-    let applied = manager.update_config_checked().await;
+    let applied = manager
+        .update_config_checked_with_runtime_guard(|generated| {
+            validate_manual_generation(generated, &profile_uid, &fingerprint, &settings, activate)
+        })
+        .await;
     // The manager may retain an accepted runtime even if a later lifecycle effect failed.
     let applied_runtime = Config::runtime().await.data_arc();
     let retained = !std::sync::Arc::ptr_eq(&runtime, &applied_runtime);
@@ -203,6 +250,11 @@ pub async fn set_cloudflare_dns_bindings(
                 error: Some(format!(
                     "The core accepted the runtime, but a later step failed: {error:#}"
                 )),
+            });
+        }
+        if error.is::<ManualBindingStale>() {
+            return Ok(CloudflareDnsOutcome::Stale {
+                reason: error.to_string(),
             });
         }
         return Err(error);
@@ -226,9 +278,7 @@ pub async fn set_cloudflare_dns_bindings(
     match saved {
         Ok(()) => Ok(CloudflareDnsOutcome::Applied {
             saved: true,
-            error: (enabled && !activate).then(|| {
-                "Remaining saved bindings are inactive; remove hostnames that are no longer locally resolved proxy servers".into()
-            }),
+            error: None,
         }),
         Err(error) => Ok(CloudflareDnsOutcome::Applied {
             saved: false,
@@ -241,8 +291,8 @@ pub async fn set_cloudflare_dns_bindings(
 mod tests {
     use super::*;
     #[test]
-    fn invalid_legacy_remainders_can_only_be_saved_inactive_by_exact_removal() -> Result<()> {
-        let metadata = cloudflare_dns::CloudflareDnsRuntime {
+    fn unchanged_dormant_records_do_not_authorize_new_or_changed_non_node_bindings() -> Result<()> {
+        let mut metadata = cloudflare_dns::CloudflareDnsRuntime {
             profile_uid: "profile".into(),
             fingerprint: "source".into(),
             base: Default::default(),
@@ -250,6 +300,10 @@ mod tests {
             unknown_sources: Vec::new(),
             warnings: Vec::new(),
             active: false,
+            applied_domains: Vec::new(),
+            dormant_domains: Vec::new(),
+            restore_status: CloudflareDnsRestoreStatus::Dormant,
+            restore_reason: None,
         };
         let binding = |domain: &str| CloudflareDnsBinding {
             domain: domain.into(),
@@ -260,13 +314,154 @@ mod tests {
         let previous = vec![binding("first.example"), binding("second.example")];
         assert!(!bindings_ready_for_activation(&metadata, &previous, &previous[..1])?);
         assert!(!bindings_ready_for_activation(&metadata, &previous, &[])?);
-        assert!(bindings_ready_for_activation(&metadata, &previous, &previous).is_err());
+        assert!(!bindings_ready_for_activation(&metadata, &previous, &previous)?);
         assert!(bindings_ready_for_activation(&metadata, &previous, &[binding("injected.example")]).is_err());
         let mut modified = previous[0].clone();
         modified.target = CloudflareBindingTarget::PreferredDomain {
             domain: PREFERRED_DOMAINS[1].into(),
         };
         assert!(bindings_ready_for_activation(&metadata, &previous, &[modified]).is_err());
+        metadata.domains.push(CloudflareDomain {
+            domain: "good.example".into(),
+            occurrences: vec![CloudflareOccurrence {
+                id: "node".into(),
+                display: "good.example".into(),
+                field_path: "proxies[0].server".into(),
+                role: CloudflareOccurrenceRole::ProxyServer,
+                bindable: true,
+                reason: None,
+            }],
+            bindable: true,
+            reason: None,
+        });
+        let mut combined = previous.clone();
+        combined.push(binding("good.example"));
+        assert!(bindings_ready_for_activation(&metadata, &previous, &combined)?);
+        Ok(())
+    }
+
+    #[test]
+    fn manual_confirmation_tokens_remain_bound_to_sources_and_exact_targets() -> Result<()> {
+        let mut metadata = cloudflare_dns::CloudflareDnsRuntime {
+            profile_uid: "profile".into(),
+            fingerprint: "old-source".into(),
+            base: Default::default(),
+            domains: Vec::new(),
+            unknown_sources: Vec::new(),
+            warnings: Vec::new(),
+            active: false,
+            applied_domains: Vec::new(),
+            dormant_domains: Vec::new(),
+            restore_status: CloudflareDnsRestoreStatus::Dormant,
+            restore_reason: None,
+        };
+        let mut settings = ProfileCloudflareDnsSettings {
+            enabled: true,
+            bindings: vec![CloudflareDnsBinding {
+                domain: "node.example".into(),
+                target: CloudflareBindingTarget::FixedIp {
+                    ip: "104.16.0.1".into(),
+                    run_id: "old-run".into(),
+                },
+            }],
+            confirmation: None,
+        };
+        let token = cloudflare_dns::confirmation(&metadata, &settings)?;
+        metadata.fingerprint = "updated-source".into();
+        assert_ne!(token, cloudflare_dns::confirmation(&metadata, &settings)?);
+        metadata.fingerprint = "old-source".into();
+        settings.bindings[0].target = CloudflareBindingTarget::FixedIp {
+            ip: "104.16.0.2".into(),
+            run_id: "new-run".into(),
+        };
+        assert_ne!(token, cloudflare_dns::confirmation(&metadata, &settings)?);
+        Ok(())
+    }
+
+    #[test]
+    fn generated_manual_update_rejects_source_profile_or_token_changes_before_apply() -> Result<()> {
+        let mut metadata = cloudflare_dns::CloudflareDnsRuntime {
+            profile_uid: "profile".into(),
+            fingerprint: "reviewed-source".into(),
+            base: Default::default(),
+            domains: Vec::new(),
+            unknown_sources: Vec::new(),
+            warnings: Vec::new(),
+            active: true,
+            applied_domains: vec!["node.example".into()],
+            dormant_domains: Vec::new(),
+            restore_status: CloudflareDnsRestoreStatus::Active,
+            restore_reason: None,
+        };
+        let mut settings = ProfileCloudflareDnsSettings {
+            enabled: true,
+            bindings: vec![CloudflareDnsBinding {
+                domain: "node.example".into(),
+                target: CloudflareBindingTarget::PreferredDomain {
+                    domain: PREFERRED_DOMAINS[0].into(),
+                },
+            }],
+            confirmation: None,
+        };
+        settings.confirmation = Some(cloudflare_dns::confirmation(&metadata, &settings)?);
+        let runtime = |metadata| crate::config::runtime::IRuntime {
+            cloudflare_dns: Some(metadata),
+            ..Default::default()
+        };
+        assert!(
+            validate_manual_generation(
+                &runtime(metadata.clone()),
+                "profile",
+                "reviewed-source",
+                &settings,
+                true
+            )
+            .is_ok()
+        );
+        metadata.fingerprint = "provider-changed-during-generation".into();
+        let generated = runtime(metadata.clone());
+        let mut core_applied = false;
+        let applied = validate_manual_generation(&generated, "profile", "reviewed-source", &settings, true).map(|()| {
+            core_applied = true;
+        });
+        assert!(applied.unwrap_err().is::<ManualBindingStale>());
+        assert!(!core_applied);
+        metadata.fingerprint = "reviewed-source".into();
+        metadata.profile_uid = "different-profile".into();
+        assert!(
+            validate_manual_generation(
+                &runtime(metadata.clone()),
+                "profile",
+                "reviewed-source",
+                &settings,
+                true
+            )
+            .unwrap_err()
+            .is::<ManualBindingStale>()
+        );
+        metadata.profile_uid = "profile".into();
+        settings.bindings[0].target = CloudflareBindingTarget::PreferredDomain {
+            domain: PREFERRED_DOMAINS[1].into(),
+        };
+        assert!(
+            validate_manual_generation(
+                &runtime(metadata.clone()),
+                "profile",
+                "reviewed-source",
+                &settings,
+                true
+            )
+            .unwrap_err()
+            .is::<ManualBindingStale>()
+        );
+        settings.enabled = false;
+        settings.bindings.clear();
+        metadata.fingerprint = "changed-before-removal".into();
+        assert!(
+            validate_manual_generation(&runtime(metadata), "profile", "reviewed-source", &settings, false)
+                .unwrap_err()
+                .is::<ManualBindingStale>()
+        );
         Ok(())
     }
 

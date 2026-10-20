@@ -25,7 +25,9 @@ import {
 import {
   CLOUDFLARE_PREFERRED_DOMAINS,
   CLOUDFLARE_TEST_URL,
+  cloudflareBindingRows,
   eligibleCloudflareDomains,
+  formatCloudflareBindingStatus,
   formatCloudflareBytes,
   formatCloudflareDiagnostic,
   formatCloudflareMbps,
@@ -76,6 +78,14 @@ export const CloudflareSpeedTestViewer = forwardRef<DialogRef>((_, ref) => {
   const results = rankCloudflareResults(snapshot?.results ?? [])
   const measured = results.filter(hasCloudflareDownload)
   const domains = eligibleCloudflareDomains(inventory?.domains ?? [])
+  const bindingStatus = formatCloudflareBindingStatus(t, inventory, outcome)
+  const bindingRestore = inventory?.enabled && inventory.bindings.length > 0
+  const awaitingCore =
+    api.inventory.isPending ||
+    (bindingRestore &&
+      (inventory.restoreStatus === 'pending' ||
+        inventory.restoreStatus === 'restoring'))
+  const restoreFailed = bindingRestore && inventory.restoreStatus === 'error'
   const selectedDomain = domains.some((item) => item.domain === domain)
     ? domain
     : ''
@@ -230,11 +240,15 @@ export const CloudflareSpeedTestViewer = forwardRef<DialogRef>((_, ref) => {
                 {t('shared.statuses.loading')}
               </Typography>
             )}
-            {capability && !supported && !api.error && (
-              <Alert severity="error">
-                {t(`${key}.capabilityNotice`)} {capability.reason}
-              </Alert>
-            )}
+            {capability &&
+              !supported &&
+              !api.error &&
+              !awaitingCore &&
+              !restoreFailed && (
+                <Alert severity="error">
+                  {t(`${key}.capabilityNotice`)} {capability.reason}
+                </Alert>
+              )}
             {(error || api.error) && (
               <Alert severity="error">{error || api.error}</Alert>
             )}
@@ -335,66 +349,66 @@ export const CloudflareSpeedTestViewer = forwardRef<DialogRef>((_, ref) => {
                 {t(`${key}.apply`)}
               </Button>
             </Stack>
-            {inventory?.bindings.map((binding) => (
-              <Stack
-                key={binding.domain}
-                direction="row"
-                spacing={1}
-                sx={{
-                  alignItems: 'center',
-                  justifyContent: 'space-between',
-                  minWidth: 0,
-                }}
-              >
-                <Typography variant="body2" sx={{ minWidth: 0 }}>
-                  {binding.domain} →{' '}
-                  {binding.target.kind === 'fixed_ip'
-                    ? binding.target.ip
-                    : binding.target.domain}
-                </Typography>
-                <Button
-                  sx={{ flexShrink: 0 }}
-                  disabled={!!busy}
-                  onClick={() =>
-                    void persist(
-                      inventory.bindings.filter(
-                        (item) => item.domain !== binding.domain,
-                      ),
-                    )
-                  }
+            {inventory &&
+              cloudflareBindingRows(inventory).map(({ binding, dormant }) => (
+                <Stack
+                  key={binding.domain}
+                  direction="row"
+                  spacing={1}
+                  sx={{
+                    alignItems: 'center',
+                    justifyContent: 'space-between',
+                    minWidth: 0,
+                  }}
                 >
-                  {t('shared.actions.delete')}
-                </Button>
-              </Stack>
-            ))}
+                  <Typography variant="body2" sx={{ minWidth: 0 }}>
+                    {binding.domain} →{' '}
+                    {binding.target.kind === 'fixed_ip'
+                      ? binding.target.ip
+                      : binding.target.domain}
+                    {dormant && (
+                      <Typography
+                        component="span"
+                        variant="body2"
+                        color="text.secondary"
+                      >
+                        {' '}
+                        · {t(`${key}.bindingDormant`)}
+                      </Typography>
+                    )}
+                  </Typography>
+                  <Button
+                    sx={{ flexShrink: 0 }}
+                    disabled={!!busy}
+                    onClick={() =>
+                      void persist(
+                        inventory.bindings.filter(
+                          (item) => item.domain !== binding.domain,
+                        ),
+                      )
+                    }
+                  >
+                    {t('shared.actions.delete')}
+                  </Button>
+                </Stack>
+              ))}
             {inventory && !inventory.bindings.length && (
               <Typography variant="body2" color="text.secondary">
                 {t('shared.statuses.empty')}
               </Typography>
             )}
-            {inventory?.enabled &&
-              !inventory.effectiveEnabled &&
-              (!outcome ||
-                (outcome.status === 'applied' &&
-                  outcome.saved &&
-                  !outcome.error)) && (
-                <Alert severity="error">{t(`${key}.notApplied`)}</Alert>
-              )}
-            {outcome?.status === 'stale' && (
-              <Alert severity="error">
-                {t(`${key}.stale`)} {outcome.reason}
-              </Alert>
-            )}
-            {outcome?.status === 'confirmation_failed' && (
-              <Alert severity="error">{t(`${key}.confirmationFailed`)}</Alert>
-            )}
-            {outcome?.status === 'applied' &&
-              (!outcome.saved || outcome.error) && (
-                <Alert severity="error">
-                  {t(outcome.saved ? `${key}.notApplied` : `${key}.notSaved`)}{' '}
-                  {outcome.error}
-                </Alert>
-              )}
+            {bindingStatus &&
+              (bindingStatus.severity === 'error' ? (
+                <Alert severity="error">{bindingStatus.message}</Alert>
+              ) : (
+                <Typography
+                  variant="body2"
+                  color="text.secondary"
+                  aria-live="polite"
+                >
+                  {bindingStatus.message}
+                </Typography>
+              ))}
           </Stack>
         </Box>
 

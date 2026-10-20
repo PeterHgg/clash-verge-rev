@@ -35,7 +35,7 @@ export const useCloudflareSpeedTest = (open: boolean) => {
 
   useEffect(() => {
     if (open) void readCloudflareSpeedTest()
-  }, [open, readCloudflareSpeedTest])
+  }, [open, readCloudflareSpeedTest, inventory.data?.restoreStatus])
 
   const start = useCallback(
     async (url: string, interfaceName: string) => {

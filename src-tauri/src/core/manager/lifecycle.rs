@@ -71,14 +71,14 @@ const fn can_allow_sidecar_for_session(running_mode: &RunningMode, service_statu
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ProxyRestoreExpectation {
+pub(super) struct ProxyRestoreExpectation {
     mode: RunningMode,
     core_readiness_generation: u64,
     service_owner_generation: Option<u64>,
 }
 
 impl ProxyRestoreExpectation {
-    const fn capture(
+    pub(super) const fn capture(
         mode: RunningMode,
         core_readiness_generation: Option<u64>,
         service_owner_generation: u64,
@@ -101,7 +101,7 @@ impl ProxyRestoreExpectation {
         }
     }
 
-    fn is_valid(
+    pub(super) fn is_valid(
         self,
         current_mode: &RunningMode,
         current_core_readiness_generation: Option<u64>,
@@ -552,6 +552,7 @@ impl CoreManager {
         .ok_or_else(|| {
             anyhow::anyhow!("cannot apply system proxy before core readiness").context(SysproxyFailure::CoreNotReady)
         })?;
+        self.schedule_binding_restore(expectation).await;
         #[cfg(target_os = "macos")]
         crate::utils::resolve::dns::sync_public_dns().await;
         // At login the app usually beats the network. Leave the write to the network watcher

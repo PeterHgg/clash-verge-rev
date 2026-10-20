@@ -764,7 +764,10 @@
       },
       "apply": "应用",
       "confirmationFailed": "内核再次要求确认，变更未完成。请刷新后重试。",
-      "notApplied": "绑定变更未完成生效。"
+      "notApplied": "绑定变更未完成生效。",
+      "bindingWaiting": "等待内核就绪",
+      "bindingRestoring": "正在恢复绑定",
+      "bindingDormant": "休眠"
     }
   },
   "feedback": {

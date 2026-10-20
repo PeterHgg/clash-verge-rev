@@ -402,6 +402,10 @@ export type CloudflareDnsInventory_Deserialize = {
   bindings: CloudflareDnsBinding[]
   enabled: boolean
   effectiveEnabled: boolean
+  appliedDomains: string[]
+  dormantDomains: string[]
+  restoreStatus: CloudflareDnsRestoreStatus
+  restoreReason: string | null
   useHosts: boolean | null
   unknownSources: string[]
   warnings: string[]
@@ -414,6 +418,10 @@ export type CloudflareDnsInventory_Serialize = {
   bindings: CloudflareDnsBinding[]
   enabled: boolean
   effectiveEnabled: boolean
+  appliedDomains: string[]
+  dormantDomains: string[]
+  restoreStatus: CloudflareDnsRestoreStatus
+  restoreReason?: string | null
   useHosts: boolean | null
   unknownSources: string[]
   warnings: string[]
@@ -476,6 +484,13 @@ export type CloudflareDnsOutcome_Serialize =
       affectedDomains: string[]
       warnings: string[]
     } & { error?: never; reason?: never; saved?: never })
+
+export type CloudflareDnsRestoreStatus =
+  | 'pending'
+  | 'restoring'
+  | 'active'
+  | 'dormant'
+  | 'error'
 
 export type CloudflareDomain =
   | CloudflareDomain_Serialize

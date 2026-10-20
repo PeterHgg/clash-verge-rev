@@ -1016,7 +1016,10 @@ export interface TranslationResources {
         }
         cloudflare: {
           apply: string
+          bindingDormant: string
+          bindingRestoring: string
           bindingsTitle: string
+          bindingWaiting: string
           capabilityNotice: string
           confirmationFailed: string
           diagnostics: {

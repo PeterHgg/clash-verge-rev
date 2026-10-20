@@ -205,7 +205,7 @@ async fn current() -> Result<Option<CloudflareSnapshot>> {
     Ok(snapshot)
 }
 
-fn public_address(raw: &str) -> Result<IpAddr> {
+pub(crate) fn public_address(raw: &str) -> Result<IpAddr> {
     let ip: IpAddr = raw
         .parse()
         .map_err(|_| anyhow::anyhow!("Invalid Cloudflare candidate address"))?;
