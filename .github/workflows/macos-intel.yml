@@ -1,0 +1,214 @@
+name: Persistent DNS bindings Mac Intel package
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [adaptive/macos-intel]
+    paths: [.github/workflows/macos-intel.yml]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: persistent-intel-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_INCREMENTAL: 0
+  CARGO_NET_GIT_FETCH_WITH_CLI: true
+  HUSKY: 0
+  NODE_OPTIONS: --max-old-space-size=4096
+  SOURCE_SHA: 1b7b28ba922f6ba5e87f92243f34b47451d6e317
+  RELEASE_TAG: persistent-bindings-2.5.9-test.1
+  GH_REPO: PeterHgg/clash-verge-rev
+
+jobs:
+  build:
+    if: github.repository == 'PeterHgg/clash-verge-rev'
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        include:
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          ref: 1b7b28ba922f6ba5e87f92243f34b47451d6e317
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: '24.21.0'
+      - uses: pnpm/action-setup@f520eceda224fe1a4aed5a2a27a194379a409996 # v6
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: '1.26.8'
+          cache: false
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: '1.99.0'
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: . -> target
+          key: adaptive-${{ matrix.target }}
+          cache-on-failure: true
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Check frontend
+        run: |
+          pnpm typecheck
+          pnpm test
+          pnpm arch:check
+      - name: Prepare original packaging resources
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: pnpm run prebuild "${{ matrix.target }}"
+      - name: Build and bundle both custom core entries
+        env:
+          # Unix socket fixtures must fit macOS's short sockaddr_un pathname limit.
+          TMPDIR: /tmp
+        run: node scripts/mihomo-local-build.mjs --target "${{ matrix.target }}" --output "$RUNNER_TEMP/adaptive-core" --bundle
+      - name: Build ad-hoc signed application
+        # Do not use pnpm build: its prebuild lifecycle could replace the custom cores.
+        run: |
+          node --input-type=module -e 'import {writeFileSync} from "node:fs"; writeFileSync("adaptive-test.conf.json", JSON.stringify({bundle:{createUpdaterArtifacts:false,macOS:{signingIdentity:"-"}}}))'
+          pnpm exec tauri build --target "${{ matrix.target }}" --bundles app --config "$GITHUB_WORKSPACE/adaptive-test.conf.json"
+      - name: Finalize identical signed core entries
+        run: node scripts/adaptive-macos-finalize.mjs "$RUNNER_TEMP/adaptive-core" "target/${{ matrix.target }}/release/bundle/macos/Clash Verge.app"
+      - name: Name Intel application archive
+        run: |
+          node --input-type=module -e 'import {readFileSync,writeFileSync} from "node:fs"; const p="scripts/adaptive-artifacts.mjs"; const s=readFileSync(p,"utf8"); if(!s.includes("_arm64_CloudflarePersistentBindings.app.zip")) throw Error("Unexpected archive naming"); writeFileSync(p,s.replace("_arm64_CloudflarePersistentBindings.app.zip","_x64_CloudflarePersistentBindings.app.zip").replace("process.env.GITHUB_SHA", "process.env.SOURCE_SHA"))'
+      - name: Verify application and archive
+        env:
+          ADAPTIVE_TARGET: ${{ matrix.target }}
+        run: node scripts/adaptive-artifacts.mjs "$RUNNER_TEMP/adaptive-core" "$RUNNER_TEMP/adaptive-app-artifacts" --app
+      - name: Upload verified application archive
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: PersistentBindings-2.5.9-x64-app
+          path: ${{ runner.temp }}/adaptive-app-artifacts/*
+          if-no-files-found: error
+          retention-days: 30
+      - name: Create DMG without Finder automation
+        run: |
+          set -euxo pipefail
+          staging="$(mktemp -d "$RUNNER_TEMP/adaptive-dmg-stage.XXXXXX")"
+          ditto "target/${{ matrix.target }}/release/bundle/macos/Clash Verge.app" "$staging/Clash Verge.app"
+          ln -s /Applications "$staging/Applications"
+          mkdir -p "target/${{ matrix.target }}/release/bundle/dmg"
+          hdiutil create -volname "Clash Verge" -srcfolder "$staging" -format UDZO "target/${{ matrix.target }}/release/bundle/dmg/Clash.Verge_2.5.9_x64_CloudflarePersistentBindings.dmg"
+      - name: Verify final DMG and collect artifacts
+        env:
+          ADAPTIVE_TARGET: ${{ matrix.target }}
+        run: node scripts/adaptive-artifacts.mjs "$RUNNER_TEMP/adaptive-core" "$RUNNER_TEMP/adaptive-dmg-artifacts"
+      - name: Upload verified DMG
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: PersistentBindings-2.5.9-x64-dmg
+          path: ${{ runner.temp }}/adaptive-dmg-artifacts/*
+          if-no-files-found: error
+          retention-days: 30
+      - name: Prepare verified Intel assets for existing release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh api "repos/$GH_REPO/releases/tags/$RELEASE_TAG" > "$RUNNER_TEMP/release.json"
+          jq -e --arg sha "$SOURCE_SHA" '.target_commitish == $sha and .prerelease == true' "$RUNNER_TEMP/release.json"
+          mkdir "$RUNNER_TEMP/mac-artifacts"
+          cp -R "$RUNNER_TEMP/adaptive-app-artifacts" "$RUNNER_TEMP/mac-artifacts/PersistentBindings-2.5.9-x64-app"
+          cp -R "$RUNNER_TEMP/adaptive-dmg-artifacts" "$RUNNER_TEMP/mac-artifacts/PersistentBindings-2.5.9-x64-dmg"
+      - name: Verify checksums and core provenance
+        env:
+          ARTIFACT_ROOT: ${{ runner.temp }}/mac-artifacts
+        run: |
+          python3 -I - <<'PY'
+          import hashlib, json, os, pathlib, shutil
+          root = pathlib.Path(os.environ['ARTIFACT_ROOT'])
+          ledgers = list(root.glob('*/SHA256SUMS'))
+          assert len(ledgers) == 2, 'Expected app and DMG artifacts'
+          packages = []
+          core_hashes = []
+          for ledger in ledgers:
+              for line in ledger.read_text().splitlines():
+                  expected, name = line.split('  ', 1)
+                  assert pathlib.PurePosixPath(name).name == name, 'Unsafe artifact filename'
+                  path = ledger.parent / name
+                  assert path.is_file()
+                  assert hashlib.sha256(path.read_bytes()).hexdigest() == expected, name
+              metadata = json.loads((ledger.parent / 'package.json').read_text())
+              assert metadata['target'] == 'x86_64-apple-darwin'
+              assert metadata['source'] == f"https://github.com/{os.environ['GH_REPO']}/tree/{os.environ['SOURCE_SHA']}"
+              assert metadata['identicalCoreEntries'] is True
+              assert metadata['appleNotarized'] is False
+              assert 'v1.19.32-verge-adaptive1-cf5' in metadata['version'].split()
+              core_hashes.append(metadata['packagedCoreSha256'])
+              for name, digest in metadata['installers'].items():
+                  path = ledger.parent / name
+                  assert path.suffix in ('.dmg', '.zip')
+                  assert hashlib.sha256(path.read_bytes()).hexdigest() == digest
+                  packages.append(path)
+          assert len(set(core_hashes)) == 1, 'App and DMG core hashes differ'
+          expected_names = {'Clash.Verge_2.5.9_x64_CloudflarePersistentBindings.dmg', 'Clash.Verge_2.5.9_x64_CloudflarePersistentBindings.app.zip'}
+          assert len(packages) == 2 and {p.name for p in packages} == expected_names
+          output = root / 'upload'
+          output.mkdir()
+          checksums = []
+          for path in packages:
+              shutil.copyfile(path, output / path.name)
+              checksums.append(f'{hashlib.sha256(path.read_bytes()).hexdigest()}  {path.name}')
+          (output / 'Mac-x64-SHA256SUMS.txt').write_text('\n'.join(checksums) + '\n')
+          dmg = root / 'PersistentBindings-2.5.9-x64-dmg'
+          shutil.copyfile(dmg / 'core-build.json', output / 'Mac-x64-core-build.json')
+          shutil.copyfile(dmg / 'package.json', output / 'Mac-x64-package.json')
+          print('Verified Intel package checksums and core provenance')
+          PY
+      - name: Upload missing assets without replacing existing files
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          for file in "$RUNNER_TEMP/mac-artifacts/upload/"*; do
+            name="$(basename "$file")"
+            expected="sha256:$(shasum -a 256 "$file" | cut -d ' ' -f 1)"
+            existing="$(gh api "repos/$GH_REPO/releases/tags/$RELEASE_TAG" --jq ".assets[] | select(.name == \"$name\") | .digest")"
+            if [ -n "$existing" ]; then
+              test "$existing" = "$expected"
+              printf 'Preserved already verified asset: %s\n' "$name"
+            else
+              gh release upload "$RELEASE_TAG" "$file"
+            fi
+          done
+      - name: Verify uploaded assets and update release status
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_RUN: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          gh api "repos/$GH_REPO/releases/tags/$RELEASE_TAG" > "$RUNNER_TEMP/published-release.json"
+          python3 -I - <<'PY'
+          import hashlib, json, os, pathlib
+          temp = pathlib.Path(os.environ['RUNNER_TEMP'])
+          release = json.loads((temp / 'published-release.json').read_text())
+          assets = {asset['name']: asset for asset in release['assets']}
+          for path in (temp / 'mac-artifacts' / 'upload').iterdir():
+              asset = assets[path.name]
+              assert asset['state'] == 'uploaded' and asset['size'] == path.stat().st_size
+              assert asset['digest'] == 'sha256:' + hashlib.sha256(path.read_bytes()).hexdigest()
+          notes = release['body']
+          notes = notes.replace('No Intel package is planned.', 'Intel Mac x64 DMG and application ZIP are also available.')
+          build_link = f"Mac x64 build: https://github.com/{os.environ['GH_REPO']}/actions/runs/{os.environ['SOURCE_RUN']}"
+          if build_link not in notes:
+              notes += '\n\n' + build_link + '\n'
+          (temp / 'release-notes.md').write_text(notes)
+          print(release['html_url'])
+          PY
+          gh release edit "$RELEASE_TAG" --notes-file "$RUNNER_TEMP/release-notes.md"
+          printf 'Mac packages uploaded and verified: https://github.com/%s/releases/tag/%s\n' "$GH_REPO" "$RELEASE_TAG" >> "$GITHUB_STEP_SUMMARY"
